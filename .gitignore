@@ -1,0 +1,6 @@
+data/
+__pycache__/
+stats/
+envs/
+checkpoints/
+benchmarks/

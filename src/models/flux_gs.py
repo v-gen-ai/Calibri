@@ -156,7 +156,7 @@ class GSFluxPipeline:
         ).to(device)
         self.pipeline.transformer = extend_transformer_with_gs(self.pipeline.transformer, num_models=num_models)
 
-    def modify_gatescale(
+    def modify_scaleguidance(
         self,
         num_models: int = 1,
         scales_double: Sequence[Sequence[tuple[float, float]]] = None,

@@ -4,12 +4,12 @@ import configs.base as base
 def cmaes_image_reward():
     cfg = base.get_config()
     cfg.experiment.name = "cmaes_imagereward"
-    cfg.gatescale.num_models = 1
+    cfg.scaleguidance.num_models = 1
     cfg.optimize.max_generations = -1
-    cfg.optimize.val_every_steps = 1
+    cfg.optimize.val_every_steps = 10
     cfg.data.train_dataset = "data/t2i_compbench_train.txt"  # t2i-compbench
     cfg.data.val_dataset = "data/t2i_compbench_val.txt"  # t2i-compbench
-    cfg.optimize.population_size = 2
+    cfg.optimize.population_size = None
     cfg.reward_fn = {
         "imagereward": 1.0,
     }
@@ -21,12 +21,12 @@ def cmaes_image_reward():
 def cmaes_image_reward_2models():
     cfg = base.get_config()
     cfg.experiment.name = "cmaes_imagereward"
-    cfg.gatescale.num_models = 2
+    cfg.scaleguidance.num_models = 2
     cfg.optimize.max_generations = -1
-    cfg.optimize.val_every_steps = 1
+    cfg.optimize.val_every_steps = 10
     cfg.data.train_dataset = "data/t2i_compbench_train.txt"  # t2i-compbench
     cfg.data.val_dataset = "data/t2i_compbench_val.txt"  # t2i-compbench
-    cfg.optimize.population_size = 2
+    cfg.optimize.population_size = None
     cfg.reward_fn = {
         "imagereward": 1.0,
     }

@@ -40,7 +40,7 @@ def main(_):
         device=cfg.device,
         dtype=inference_dtype,
         model_name=cfg.model.model_name,
-        num_models=cfg.gatescale.num_models
+        num_models=cfg.scaleguidance.num_models
     )
     pipeline.pipeline.set_progress_bar_config(disable=True)
 

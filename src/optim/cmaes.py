@@ -1,271 +1,359 @@
-# trainers/cmaes_trainer.py
 import os
 import json
 import time
-from typing import Dict, List, Optional
+from typing import List, Tuple, Dict, Optional
 
 import numpy as np
 import torch
-from torch.utils.tensorboard import SummaryWriter
-
 import cma
-import torchvision
 
-from models.autoguidance_flux import AutoGuidanceFluxPipeline
-from metrics.reward import ImageRewardScorer
+from src.utils.logging_tb import log_scalars, log_hist_alphas, log_images
 
 
-def _pil_to_tensor(img):
-    # (H, W, C) uint8 -> (C, H, W) float in [0,1]
-    import torchvision.transforms.functional as F
-    return F.to_tensor(img)
+def _get_device(cfg) -> torch.device:
+    return torch.device(getattr(cfg, "device", "cuda"))
+
+
+def _gen_params(cfg) -> Dict:
+    return {
+        "num_inference_steps": int(cfg.gen.num_inference_steps),
+        "guidance_scale": float(cfg.gen.guidance_scale),
+        "height": int(cfg.gen.image_size),
+        "width": int(cfg.gen.image_size),
+    }
+
+
+def _transformer_dims(pipeline) -> Tuple[int, int, int]:
+    t = pipeline.pipeline.transformer
+    n_double = len(t.transformer_blocks)
+    n_single = len(t.single_transformer_blocks)
+    n_models = len(t.models_scales)
+    return n_double, n_single, n_models
+
+
+def _flatten_from_transformer(pipeline) -> np.ndarray:
+    t = pipeline.pipeline.transformer
+    n_double, n_single, n_models = _transformer_dims(pipeline)
+    vec = []
+    # doubles (attn, mlp)
+    for m in range(n_models):
+        for b in range(n_double):
+            w_attn, w_mlp = t.transformer_gate_scales[m][b]
+            vec.append(float(w_attn.detach().cpu().item()))
+            vec.append(float(w_mlp.detach().cpu().item()))
+    # singles
+    for m in range(n_models):
+        for b in range(n_single):
+            w = t.single_gate_scales[m][b]
+            vec.append(float(w.detach().cpu().item()))
+    # models_scales
+    ms = t.models_scales.detach().cpu().to(torch.float64).numpy().astype(np.float64).tolist()
+    vec.extend(ms)
+    return np.asarray(vec, dtype=np.float64)
+
+
+def _vector_shapes(pipeline) -> Dict[str, int]:
+    n_double, n_single, n_models = _transformer_dims(pipeline)
+    doubles = n_models * n_double * 2
+    singles = n_models * n_single
+    models = n_models
+    return {"doubles": doubles, "singles": singles, "models": models, "total": doubles + singles + models,
+            "n_double": n_double, "n_single": n_single, "n_models": n_models}
+
+
+def _unflatten_to_gs(x: np.ndarray, shapes: Dict[str, int]):
+    d_doubles = shapes["doubles"]
+    d_singles = shapes["singles"]
+    n_double = shapes["n_double"]
+    n_single = shapes["n_single"]
+    n_models = shapes["n_models"]
+
+    doubles = x[:d_doubles]
+    singles = x[d_doubles:d_doubles + d_singles]
+    models = x[d_doubles + d_singles:]
+
+    # build per-model
+    scales_double = []
+    scales_single = []
+
+    # doubles per model: n_double * 2
+    per_model_doubles = n_double * 2
+    for m in range(n_models):
+        md = []
+        start = m * per_model_doubles
+        for b in range(n_double):
+            a = doubles[start + 2 * b + 0]
+            c = doubles[start + 2 * b + 1]
+            md.append((float(a), float(c)))
+        scales_double.append(md)
+
+    # singles per model: n_single
+    for m in range(n_models):
+        ms = []
+        start = m * n_single
+        for b in range(n_single):
+            ms.append(float(singles[start + b]))
+        scales_single.append(ms)
+
+    models_scales = [float(v) for v in models.tolist()]
+    return scales_double, scales_single, models_scales
+
+
+def _mean_score(scores) -> float:
+    if scores is None:
+        return -np.inf
+    if isinstance(scores, (list, tuple)):
+        if len(scores) == 0:
+            return -np.inf
+        return float(np.mean([float(s) for s in scores]))
+    if torch.is_tensor(scores):
+        if scores.numel() == 0:
+            return -np.inf
+        return float(scores.float().mean().item())
+    return float(scores)
+
+
+def _call_reward(fn, images, prompts):
+    # Унифицируем контракт: всегда возвращаем только список/массив числовых scores
+    try:
+        out = fn(images, prompts, None)
+    except TypeError:
+        out = fn(images, prompts)
+    return list(out[0])
 
 
 class CMAESTrainer:
-    """
-    Полная перепись тренера CMA-ES с батчевой оценкой:
-    - На каждое поколение эволюции берётся ровно один следующий батч из train_loader.
-    - Все кандидаты поколения оцениваются на этом одном и том же батче (общая стохастика).
-    - Валидация выполняется по расписанию и считается по всей val-выборке батчами.
-    - Логи и примеры изображений пишутся в TensorBoard; чекпоинты сохраняются по расписанию.
-    """
-
-    def __init__(self, cfg, train_loader, val_loader):
+    def __init__(self, cfg, pipeline, reward_fn, eval_reward_fn, writer, train_loader, val_loader):
         self.cfg = cfg
+        self.pipeline = pipeline  # GSFluxPipeline
+        self.reward_fn = reward_fn
+        self.eval_reward_fn = eval_reward_fn
+        self.writer = writer
         self.train_loader = train_loader
         self.val_loader = val_loader
 
-        self.device = torch.device(cfg.device if torch.cuda.is_available() else "cpu")
+        self.device = _get_device(cfg)
+        self.gen_params = _gen_params(cfg)
 
-        # Пайплайны и параметры alphas
-        self.pipeline = AutoGuidanceFluxPipeline(
-            cfg.model.main_model, cfg.model.guidance_model, cfg.model.torch_dtype
+        self.shapes = _vector_shapes(self.pipeline)
+        self.dim = self.shapes["total"]
+
+        # Initial point from current transformer state
+        x0 = _flatten_from_transformer(self.pipeline)
+
+        # CMA-ES options
+        opts = {
+            "seed": int(cfg.experiment.seed) if getattr(cfg.experiment, "seed", None) is not None else None,
+        }
+        if getattr(cfg.optimize, "population_size", None):
+            opts["popsize"] = int(cfg.optimize.population_size)
+
+        bounds_low: List[float] = []
+        bounds_high: List[float] = []
+        has_bounds = False
+
+        if getattr(cfg.gatescale, "blocks_bound_low", None) is not None:
+            blocks_bound_low = cfg.optimize.blocks_bound_low
+            blocks_bound_high = cfg.optimize.blocks_bound_high
+            models_bound_low = cfg.optimize.models_bound_low
+            models_bound_high = cfg.optimize.models_bound_high
+            has_bounds = True
+
+        if has_bounds:
+            bounds_low.extend([float(blocks_bound_low)] * self.shapes["doubles"])
+            bounds_high.extend([float(blocks_bound_high)] * self.shapes["doubles"])
+
+            bounds_low.extend([float(blocks_bound_low)] * self.shapes["singles"])
+            bounds_high.extend([float(blocks_bound_high)] * self.shapes["singles"])
+
+            bounds_low.extend([float(models_bound_low)] * self.shapes["models"])
+            bounds_high.extend([float(models_bound_high)] * self.shapes["models"])
+
+            opts["bounds"] = [bounds_low, bounds_high]
+
+        self.es = cma.CMAEvolutionStrategy(
+            x0=x0,
+            sigma0=float(cfg.optimize.initial_sigma),
+            inopts=opts,
         )
 
-        # Ревард-модель
-        self.reward = ImageRewardScorer()
-
-        # Размерность вектора решения: [main_alphas | guide_alphas | guidance_weight]
-        n_double, n_single, dim_per_model, _ = self.pipeline.dims()
-        self.dim_per_model = dim_per_model
-        self.total_dim = dim_per_model * 2 + 1
-
-        # Инициализация стартовой точки
-        x0 = np.concatenate([
-            np.full(dim_per_model, 1.0, dtype=np.float64),   # main alphas
-            np.full(dim_per_model, 1.0, dtype=np.float64),   # guidance alphas
-            np.array([cfg.autog.initial_guidance_weight], dtype=np.float64),
-        ])
-
-        # Границы: alphas по alpha_bounds, вес guidance [0,1]
-        bounds_low = [cfg.autog.alpha_bounds[0]] * (dim_per_model * 2) + [0.0]
-        bounds_high = [cfg.autog.alpha_bounds[1]] * (dim_per_model * 2) + [1.0]
-
-        # Настройки CMA-ES
-        opts = {
-            "bounds": [bounds_low, bounds_high],
-            "verb_disp": cfg.cmaes.verb_disp,
-            "verb_log": cfg.cmaes.verb_log,
-            "maxiter": cfg.cmaes.max_generations,
-            "seed": cfg.cmaes.seed,
-        }
-        if cfg.cmaes.population_size:
-            opts["popsize"] = cfg.cmaes.population_size
-
-        self.es = cma.CMAEvolutionStrategy(x0, cfg.cmaes.initial_sigma, opts)
-
-        # TensorBoard
-        run_dir = f"{cfg.log_dir}/{cfg.experiment_name}_{int(time.time())}"
-        os.makedirs(run_dir, exist_ok=True)
-        self.writer = SummaryWriter(run_dir)
-        self.run_dir = run_dir
-
-        # Истории метрик
-        self.best_fitness_history: List[float] = []
-        self.mean_fitness_history: List[float] = []
-        self.validation_fitness_history: List[Optional[float]] = []
-        self.guidance_weight_history: List[float] = []
-        self.sigma_history: List[float] = []
-
-        # Ранняя остановка
+        # state
+        self._train_iter = iter(self.train_loader)
+        self.best_solution = x0.copy()
+        self.best_train = -np.inf
         self.best_val = -np.inf
         self.patience = 0
 
-        # Stateful итератор по train
-        self.train_iter = iter(self.train_loader)
+        # history
+        self.hist_train_best: List[float] = []
+        self.hist_train_mean: List[float] = []
+        self.hist_val: List[Optional[float]] = []
+        self.hist_sigma: List[float] = []
+        self.hist_models_scales: List[List[float]] = []
 
-    def _next_train_batch(self) -> List[str]:
+    def _next_batch(self) -> List[str]:
         try:
-            return next(self.train_iter)
+            batch = next(self._train_iter)
         except StopIteration:
-            self.train_iter = iter(self.train_loader)
-            return next(self.train_iter)
+            self._train_iter = iter(self.train_loader)
+            batch = next(self._train_iter)
+        return list(batch)
 
-    def _apply_params(self, x: np.ndarray) -> float:
-        """
-        Применяет вектор параметров к пайплайну и возвращает guidance_weight.
-        """
-        _, _, gw = self.pipeline.vector_to_params(x, self.cfg.autog.alpha_bounds)
-        return float(gw)
+    def _apply_x_via_pipeline(self, x: np.ndarray):
+        scales_double, scales_single, models_scales = _unflatten_to_gs(x, self.shapes)
+        self.pipeline.modify_gatescale(
+            num_models=self.shapes["n_models"],
+            scales_double=scales_double,
+            scales_single=scales_single,
+            models_scales=models_scales,
+        )
 
-    def _eval_on_batch(
-        self,
-        x: np.ndarray,
-        batch_prompts: List[str],
-        gen_params: Dict,
-        seed: int,
-    ) -> float:
-        """
-        Оценка среднего reward на заданном списке промптов (один батч).
-        """
-        gw = self._apply_params(x)
-        generator = torch.Generator(device=self.device if self.device.type == "cuda" else "cpu").manual_seed(int(seed))
-        images = self.pipeline.generate_batch(
-            prompts=batch_prompts,
-            guidance_weight=gw,
-            num_inference_steps=gen_params["num_inference_steps"],
-            guidance_scale=gen_params["guidance_scale"],
-            height=gen_params["image_size"],
-            width=gen_params["image_size"],
+    def _gen_images(self, prompts: List[str], seed: int):
+        # For fair comparison within a generation, fix generator
+        gen_device = "cpu"  # reproducibility: CPU generator recommended by diffusers
+        generator = torch.Generator(device=gen_device).manual_seed(int(seed))
+        out = self.pipeline(
+            prompts,
+            num_inference_steps=self.gen_params["num_inference_steps"],
+            guidance_scale=self.gen_params["guidance_scale"],
+            height=self.gen_params["height"],
+            width=self.gen_params["width"],
             generator=generator,
         )
-        scores = self.reward.score_batch(batch_prompts, images)
-        return float(np.mean(scores)) if len(scores) else -np.inf
+        return out.images
 
-    def _eval_validation(
-        self,
-        x: np.ndarray,
-        gen_params: Dict,
-        seed: int = 1234,
-    ) -> float:
-        """
-        Агрегированная валидация по всей val-выборке (батчами).
-        """
-        gw = self._apply_params(x)
-        total, count = 0.0, 0
-        for batch_prompts in self.val_loader:
-            generator = torch.Generator(device=self.device if self.device.type == "cuda" else "cpu").manual_seed(int(seed))
-            images = self.pipeline.generate_batch(
-                prompts=batch_prompts,
-                guidance_weight=gw,
-                num_inference_steps=gen_params["num_inference_steps"],
-                guidance_scale=gen_params["guidance_scale"],
-                height=gen_params["image_size"],
-                width=gen_params["image_size"],
+    def _eval_candidate_on_batch(self, x: np.ndarray, prompts: List[str], seed: int) -> float:
+        self._apply_x_via_pipeline(x)
+        images = self._gen_images(prompts, seed)
+        scores = _call_reward(self.reward_fn, images, prompts)
+        return _mean_score(scores)
+
+    def _eval_validation(self, x: np.ndarray, seed: int = 1234) -> float:
+        self._apply_x_via_pipeline(x)
+        total = 0.0
+        count = 0
+        gen_device = "cpu"
+        for prompts in self.val_loader:
+            generator = torch.Generator(device=gen_device).manual_seed(int(seed))
+            out = self.pipeline(
+                list(prompts),
+                num_inference_steps=self.gen_params["num_inference_steps"],
+                guidance_scale=self.gen_params["guidance_scale"],
+                height=self.gen_params["height"],
+                width=self.gen_params["width"],
                 generator=generator,
             )
-            scores = self.reward.score_batch(batch_prompts, images)
-            total += float(np.sum(scores))
-            count += len(scores)
+            images = out.images
+            scores = _call_reward(self.eval_reward_fn, images, list(prompts))
+            if isinstance(scores, (list, tuple)):
+                total += float(np.sum([float(s) for s in scores]))
+                count += len(scores)
+            elif torch.is_tensor(scores):
+                total += float(scores.float().sum().item())
+                count += int(scores.numel())
+            else:
+                total += float(scores)
+                count += 1
         return float(total / max(1, count))
 
-    def _log_images(self, tag: str, prompts: List[str], images: List[torch.Tensor], step: int):
-        n = min(len(images), self.cfg.max_images_to_log)
-        if n <= 0:
-            return
-        grid = torchvision.utils.make_grid(
-            torch.stack([_pil_to_tensor(im) for im in images[:n]]),
-            nrow=n,
-            padding=2,
-        )
-        self.writer.add_image(tag, grid, global_step=step)
-
-    def _log_alphas(self, x: np.ndarray, step: int):
-        n = self.dim_per_model
-        main = x[:n]
-        guide = x[n: 2 * n]
-        self.writer.add_histogram("alphas/main", torch.tensor(main), step)
-        self.writer.add_histogram("alphas/guidance", torch.tensor(guide), step)
-        self.writer.add_scalar("guidance/weight", float(x[2 * n]), step)
-
-    def _checkpoint(self, generation: int, best_fit: float, mean_fit: float, val_fit: Optional[float], gw: float):
-        if not self.cfg.save_checkpoints:
-            return
-        if not (generation % self.cfg.save_every == 0 or generation == 0):
-            return
-        os.makedirs(self.cfg.checkpoint_dir, exist_ok=True)
-        ckpt = {
-            "generation": generation,
-            "best_fitness": float(best_fit),
-            "mean_fitness": float(mean_fit),
-            "val_fitness": None if val_fit is None else float(val_fit),
-            "guidance_weight": float(gw),
+    def _log_step(self, step: int, best_fit: float, mean_fit: float, sigma: float, best_x: np.ndarray):
+        scalars = {
+            "train/best": float(best_fit),
+            "train/mean": float(mean_fit),
+            "cmaes/sigma": float(sigma),
         }
-        path = os.path.join(self.cfg.checkpoint_dir, f"ckpt_gen{generation:03d}.json")
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump(ckpt, f, indent=2, ensure_ascii=False)
+        log_scalars(self.writer, scalars, step)
 
-    def train(self) -> Dict[str, List]:
-        gen_params = {
-            "num_inference_steps": self.cfg.gen.num_inference_steps,
-            "guidance_scale": self.cfg.gen.guidance_scale,
-            "image_size": self.cfg.gen.image_size,
+        d_doubles = self.shapes["doubles"]
+        d_singles = self.shapes["singles"]
+        doubles = best_x[:d_doubles]
+        singles = best_x[d_doubles:d_doubles + d_singles]
+        models = best_x[d_doubles + d_singles:]
+
+        attn = doubles[0::2]
+        mlp = doubles[1::2]
+
+        alpha_dict = {
+            "double_attn": np.array(attn, dtype=np.float32),
+            "double_mlp": np.array(mlp, dtype=np.float32),
+            "single": np.array(singles, dtype=np.float32),
+            "models_scales": np.array(models, dtype=np.float32),
         }
+        log_hist_alphas(self.writer, alpha_dict, step, prefix="alphas/")
 
+        self.hist_sigma.append(float(sigma))
+        self.hist_models_scales.append(models.tolist())
+
+    def _maybe_log_images(self, step: int, prompts: List[str], x: np.ndarray, tag: str = "samples/train"):
+        if not getattr(self.cfg.experiment, "save_images", False):
+            return
+        self._apply_x_via_pipeline(x)
+        show_seed = int(getattr(self.cfg.experiment, "seed", 0)) + step + 777
+        images = self._gen_images(prompts, show_seed)
+        log_images(self.writer, tag, images, step)
+
+    def _checkpoint_json(self, step: int, best_fit: float, mean_fit: float, val_fit: Optional[float], best_x: np.ndarray):
+        if not getattr(self.cfg.experiment, "save_json", False):
+            return
+        run_dir = getattr(self.writer, "log_dir", None) or os.path.join(self.cfg.experiment.log_dir, self.cfg.experiment.name)
+        os.makedirs(run_dir, exist_ok=True)
+        payload = {
+            "step": int(step),
+            "train_best": float(best_fit),
+            "train_mean": float(mean_fit),
+            "val": None if val_fit is None else float(val_fit),
+            "solution": [float(v) for v in best_x.tolist()],
+            "shapes": self.shapes,
+            "timestamp": int(time.time()),
+        }
+        with open(os.path.join(run_dir, f"cmaes_step_{step:04d}.json"), "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False, indent=2)
+
+    def train(self) -> Tuple[np.ndarray, float, float]:
         generation = 0
-        max_gens = int(self.cfg.cmaes.max_generations)
+        max_gens = int(self.cfg.optimize.max_generations)
+        base_seed = int(getattr(self.cfg.experiment, "seed", 0))
 
         while not self.es.stop() and generation < max_gens:
             step = generation + 1
 
-            # 1) Один следующий train-батч для всего поколения
-            batch_prompts = self._next_train_batch()
+            # one shared train batch per generation
+            batch_prompts = self._next_batch()
 
-            # 2) Оценка всех кандидатов на этом батче
-            solutions = self.es.ask()
-            base_seed = int(self.cfg.seed) + generation  # одинаковая стохастика внутри поколения
+            # evaluate candidates on the same batch
+            candidates = self.es.ask()
             fitnesses = []
-            for x in solutions:
-                # CMA-ES минимизирует => берем отрицание reward
-                f = -self._eval_on_batch(
-                    x=x,
-                    batch_prompts=batch_prompts,
-                    gen_params=gen_params,
-                    seed=base_seed,
-                )
-                fitnesses.append(float(f))
+            for x in candidates:
+                score = self._eval_candidate_on_batch(x, batch_prompts, seed=base_seed + generation)
+                fitnesses.append(-float(score))  # CMA-ES minimizes
 
-            # 3) Обновление стратегии
-            self.es.tell(solutions, fitnesses)
+            self.es.tell(candidates, fitnesses)
 
-            # 4) Подсчёт метрик поколения
+            # generation metrics
             best_idx = int(np.argmin(fitnesses))
-            best_x = solutions[best_idx]
+            best_x = np.asarray(candidates[best_idx], dtype=np.float64)
             best_fit = -float(fitnesses[best_idx])
             mean_fit = -float(np.mean(fitnesses))
-            gw = self._apply_params(best_x)
 
-            self.best_fitness_history.append(best_fit)
-            self.mean_fitness_history.append(mean_fit)
-            self.sigma_history.append(float(self.es.sigma))
-            self.guidance_weight_history.append(float(gw))
+            # track best
+            if best_fit > self.best_train:
+                self.best_train = best_fit
+                self.best_solution = best_x.copy()
 
-            self.writer.add_scalar("train/best", best_fit, step)
-            self.writer.add_scalar("train/mean", mean_fit, step)
-            self.writer.add_scalar("cmaes/sigma", float(self.es.sigma), step)
-            self._log_alphas(best_x, step)
+            self.hist_train_best.append(best_fit)
+            self.hist_train_mean.append(mean_fit)
 
-            # 5) Лог изображений на том же батче
-            if self.cfg.log_images_every and (step % self.cfg.log_images_every == 0 or step == 1):
-                images = self.pipeline.generate_batch(
-                    prompts=batch_prompts,
-                    guidance_weight=gw,
-                    num_inference_steps=gen_params["num_inference_steps"],
-                    guidance_scale=gen_params["guidance_scale"],
-                    height=gen_params["image_size"],
-                    width=gen_params["image_size"],
-                    generator=torch.Generator(device=self.device if self.device.type == "cuda" else "cpu").manual_seed(base_seed + 777),
-                )
-                self._log_images("samples/train", batch_prompts, images, step)
+            # logging
+            self._log_step(step, best_fit, mean_fit, float(self.es.sigma), best_x)
+            self._maybe_log_images(step, batch_prompts, best_x)
 
-            # 6) Валидация по расписанию
-            do_val = self.cfg.train.val_every and (step % self.cfg.train.val_every == 0 or step == max_gens)
+            # validation schedule
+            do_val = int(self.cfg.optimize.val_every_steps) > 0 and (step % int(self.cfg.optimize.val_every_steps) == 0 or step == max_gens)
             if do_val:
-                val_score = self._eval_validation(best_x, gen_params, seed=1234)
-                self.validation_fitness_history.append(val_score)
-                self.writer.add_scalar("val/mean", float(val_score), step)
+                val_score = self._eval_validation(best_x, seed=1234)
+                self.hist_val.append(val_score)
+                log_scalars(self.writer, {"val/mean": float(val_score)}, step)
 
-                # Ранняя остановка/переобучение
                 train_val_gap = best_fit - float(val_score)
                 if val_score > self.best_val:
                     self.best_val = float(val_score)
@@ -273,31 +361,24 @@ class CMAESTrainer:
                 else:
                     self.patience += 1
 
-                should_stop = False
-                if self.patience >= int(self.cfg.train.early_stopping_patience):
-                    should_stop = True
-                if train_val_gap > float(self.cfg.train.overfitting_threshold) and self.patience >= int(self.cfg.train.early_stopping_patience):
-                    should_stop = True
+                # if self.patience >= int(self.cfg.optimize.early_stopping_patience):
+                #     self._checkpoint_json(step, best_fit, mean_fit, val_score, best_x)
+                #     break
 
-                if should_stop:
-                    self._checkpoint(generation, best_fit, mean_fit, val_score, gw)
-                    break
+                # if train_val_gap > float(self.cfg.optimize.overfitting_threshold) and self.patience >= int(self.cfg.optimize.early_stopping_patience):
+                #     self._checkpoint_json(step, best_fit, mean_fit, val_score, best_x)
+                #     break
             else:
-                self.validation_fitness_history.append(None)
+                self.hist_val.append(None)
 
-            # 7) Чекпоинт
-            self._checkpoint(generation, best_fit, mean_fit, self.validation_fitness_history[-1], gw)
+            # checkpoint
+            self._checkpoint_json(step, best_fit, mean_fit, self.hist_val[-1], best_x)
 
             generation += 1
 
-        self.writer.flush()
-        self.writer.close()
+        # final checkpoint
+        last_mean = float(self.hist_train_mean[-1]) if self.hist_train_mean else float("-inf")
+        last_val = self.best_val if (self.hist_val and self.hist_val[-1] is not None) else None
+        self._checkpoint_json(generation, self.best_train, last_mean, last_val, self.best_solution)
 
-        return {
-            "train_best": self.best_fitness_history,
-            "train_mean": self.mean_fitness_history,
-            "val": self.validation_fitness_history,
-            "sigma": self.sigma_history,
-            "guidance_weight": self.guidance_weight_history,
-            "run_dir": self.run_dir,
-        }
+        return self.best_solution, float(self.best_train), float(self.best_val if self.best_val != -np.inf else np.nan)

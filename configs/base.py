@@ -23,7 +23,7 @@ def get_config():
     cfg.gen.guidance_scale = 3.5
     cfg.gen.image_size = 512
 
-    cfg.gatescale = ConfigDict()
+    cfg.scaleguidance = ConfigDict()
 
     cfg.optimize = ConfigDict()
     cfg.optimize.initial_sigma = 0.25

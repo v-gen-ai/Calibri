@@ -1,0 +1,15 @@
+torch
+absl-py
+diffusers
+accelerate
+transformers==4.52.1
+tensorboard
+tqdm
+numpy
+matplotlib
+ml-collections
+cma
+sentencepiece
+### image reward dependencies
+image-reward
+clip

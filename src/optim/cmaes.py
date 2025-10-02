@@ -166,7 +166,7 @@ class CMAESTrainer:
         bounds_high: List[float] = []
         has_bounds = False
 
-        if getattr(cfg.gatescale, "blocks_bound_low", None) is not None:
+        if getattr(cfg.scaleguidance, "blocks_bound_low", None) is not None:
             blocks_bound_low = cfg.optimize.blocks_bound_low
             blocks_bound_high = cfg.optimize.blocks_bound_high
             models_bound_low = cfg.optimize.models_bound_low
@@ -216,7 +216,7 @@ class CMAESTrainer:
 
     def _apply_x_via_pipeline(self, x: np.ndarray):
         scales_double, scales_single, models_scales = _unflatten_to_gs(x, self.shapes)
-        self.pipeline.modify_gatescale(
+        self.pipeline.modify_scaleguidance(
             num_models=self.shapes["n_models"],
             scales_double=scales_double,
             scales_single=scales_single,

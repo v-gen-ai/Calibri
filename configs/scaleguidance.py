@@ -3,7 +3,7 @@ import configs.base as base
 
 def cmaes_image_reward():
     cfg = base.get_config()
-    cfg.experiment.name = "cmaes_imagereward"
+    cfg.experiment.name = "cmaes_imgr"
     cfg.scaleguidance.num_models = 1
     cfg.optimize.max_generations = -1
     cfg.optimize.val_every_steps = 10
@@ -20,7 +20,7 @@ def cmaes_image_reward():
 
 def cmaes_image_reward_2models():
     cfg = base.get_config()
-    cfg.experiment.name = "cmaes_imagereward"
+    cfg.experiment.name = "cmaes_imgr"
     cfg.scaleguidance.num_models = 2
     cfg.optimize.max_generations = -1
     cfg.optimize.val_every_steps = 10

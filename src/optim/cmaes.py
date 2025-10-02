@@ -4,10 +4,12 @@ import time
 from typing import List, Tuple, Dict, Optional
 
 import numpy as np
+from tqdm import tqdm
 import torch
 import cma
 
-from src.utils.logging_tb import log_scalars, log_hist_alphas, log_images
+from src.utils.logging_tb import log_scalars, log_hist_alphas, log_images, log_scatter
+from src.data.prompts import get_lines
 
 
 def _get_device(cfg) -> torch.device:
@@ -21,6 +23,10 @@ def _gen_params(cfg) -> Dict:
         "height": int(cfg.gen.image_size),
         "width": int(cfg.gen.image_size),
     }
+
+def _iter_chunks(seq, size):
+    for i in tqdm(range(0, len(seq), size), desc="bucket iteration during train"):
+        yield seq[i:i + size]
 
 
 def _transformer_dims(pipeline) -> Tuple[int, int, int]:
@@ -99,18 +105,26 @@ def _unflatten_to_gs(x: np.ndarray, shapes: Dict[str, int]):
     return scales_double, scales_single, models_scales
 
 
-def _mean_score(scores) -> float:
-    if scores is None:
-        return -np.inf
-    if isinstance(scores, (list, tuple)):
-        if len(scores) == 0:
-            return -np.inf
-        return float(np.mean([float(s) for s in scores]))
-    if torch.is_tensor(scores):
-        if scores.numel() == 0:
-            return -np.inf
-        return float(scores.float().mean().item())
-    return float(scores)
+def _mean_score(scores, mode="mean") -> float:
+    res_scores = {}
+    for name, score_seq in scores.items():
+        if score_seq is None:
+            res_scores[name] = -np.inf
+        if torch.is_tensor(score_seq):
+            if score_seq.numel() == 0:
+                res_scores[name] = -np.inf
+            if mode == "mean":
+                res_scores[name] = float(score_seq.float().mean().item())
+            elif mode == "sum":
+                res_scores[name] = float(score_seq.float().sum().item())
+        else:
+            if len(score_seq) == 0:
+                res_scores[name] = -np.inf
+            if mode == "mean":
+                res_scores[name] = float(np.mean([float(s) for s in score_seq]))
+            elif mode == "sum":
+                res_scores[name] = float(np.sum([float(s) for s in score_seq]))
+    return res_scores
 
 
 def _call_reward(fn, images, prompts):
@@ -119,7 +133,7 @@ def _call_reward(fn, images, prompts):
         out = fn(images, prompts, None)
     except TypeError:
         out = fn(images, prompts)
-    return list(out[0])
+    return out[0]
 
 
 class CMAESTrainer:
@@ -186,6 +200,7 @@ class CMAESTrainer:
 
         # history
         self.hist_train_best: List[float] = []
+        self.hist_train_best_scores: List[float] = []
         self.hist_train_mean: List[float] = []
         self.hist_val: List[Optional[float]] = []
         self.hist_sigma: List[float] = []
@@ -208,7 +223,7 @@ class CMAESTrainer:
             models_scales=models_scales,
         )
 
-    def _gen_images(self, prompts: List[str], seed: int):
+    def _gen_images_batch(self, prompts: List[str], seed: int):
         # For fair comparison within a generation, fix generator
         gen_device = "cpu"  # reproducibility: CPU generator recommended by diffusers
         generator = torch.Generator(device=gen_device).manual_seed(int(seed))
@@ -222,18 +237,38 @@ class CMAESTrainer:
         )
         return out.images
 
-    def _eval_candidate_on_batch(self, x: np.ndarray, prompts: List[str], seed: int) -> float:
+    # def _eval_candidate_on_batch(self, x: np.ndarray, prompts: List[str], seed: int) -> float:
+    #     self._apply_x_via_pipeline(x)
+    #     images = self._gen_images_batch(prompts, seed)
+    #     scores = _call_reward(self.reward_fn, images, prompts)
+    #     return _mean_score(scores)
+
+    def _eval_candidate_on_bucket(self, x: np.ndarray, bucket_prompts: List[str], seed: int) -> Dict[str, float]:
+        # применяем параметры кандидата
         self._apply_x_via_pipeline(x)
-        images = self._gen_images(prompts, seed)
-        scores = _call_reward(self.reward_fn, images, prompts)
-        return _mean_score(scores)
+        total_scores = None
+        count = 0
+        micro_bs = int(self.cfg.data.batch_size)
+        for mini in _iter_chunks(bucket_prompts, micro_bs):
+            images = self._gen_images_batch(list(mini), seed)
+            scores = _call_reward(self.reward_fn, images, list(mini))
+            sum_scores = _mean_score(scores, mode="sum")
+            if total_scores is None:
+                total_scores = sum_scores
+            else:
+                for name, s in sum_scores.items():
+                    total_scores[name] += s
+            count += len(mini)
+        # усредняем метрики по всему bucket
+        return {name: float(score) / float(count) for name, score in total_scores.items()}
 
     def _eval_validation(self, x: np.ndarray, seed: int = 1234) -> float:
         self._apply_x_via_pipeline(x)
-        total = 0.0
+        # total = 0.0
+        total_scores = None
         count = 0
         gen_device = "cpu"
-        for prompts in self.val_loader:
+        for prompts in tqdm(self.val_loader, desc="Validating", total=len(self.val_loader)):
             generator = torch.Generator(device=gen_device).manual_seed(int(seed))
             out = self.pipeline(
                 list(prompts),
@@ -245,16 +280,42 @@ class CMAESTrainer:
             )
             images = out.images
             scores = _call_reward(self.eval_reward_fn, images, list(prompts))
-            if isinstance(scores, (list, tuple)):
-                total += float(np.sum([float(s) for s in scores]))
-                count += len(scores)
-            elif torch.is_tensor(scores):
-                total += float(scores.float().sum().item())
-                count += int(scores.numel())
+            sum_scores = _mean_score(scores, mode="sum")
+            if total_scores is None:
+                total_scores = sum_scores
             else:
-                total += float(scores)
-                count += 1
-        return float(total / max(1, count))
+                for name, score in sum_scores.items():
+                    total_scores[name] += score
+            count += len(prompts)
+        return {name: score / count for name, score in total_scores.items()}
+
+    # def _log_step(self, step: int, best_fit: float, mean_fit: float, sigma: float, best_x: np.ndarray):
+    #     scalars = {
+    #         "train/best": float(best_fit),
+    #         "train/mean": float(mean_fit),
+    #         "cmaes/sigma": float(sigma),
+    #     }
+    #     log_scalars(self.writer, scalars, step)
+
+    #     d_doubles = self.shapes["doubles"]
+    #     d_singles = self.shapes["singles"]
+    #     doubles = best_x[:d_doubles]
+    #     singles = best_x[d_doubles:d_doubles + d_singles]
+    #     models = best_x[d_doubles + d_singles:]
+
+    #     attn = doubles[0::2]
+    #     mlp = doubles[1::2]
+
+    #     alpha_dict = {
+    #         "double_attn": np.array(attn, dtype=np.float32),
+    #         "double_mlp": np.array(mlp, dtype=np.float32),
+    #         "single": np.array(singles, dtype=np.float32),
+    #         "models_scales": np.array(models, dtype=np.float32),
+    #     }
+    #     log_scatter(self.writer, alpha_dict, step, prefix="alphas/")
+
+    #     self.hist_sigma.append(float(sigma))
+    #     self.hist_models_scales.append(models.tolist())
 
     def _log_step(self, step: int, best_fit: float, mean_fit: float, sigma: float, best_x: np.ndarray):
         scalars = {
@@ -264,38 +325,40 @@ class CMAESTrainer:
         }
         log_scalars(self.writer, scalars, step)
 
-        d_doubles = self.shapes["doubles"]
-        d_singles = self.shapes["singles"]
-        doubles = best_x[:d_doubles]
-        singles = best_x[d_doubles:d_doubles + d_singles]
-        models = best_x[d_doubles + d_singles:]
+        # Восстанавливаем по-модельные коэффициенты
+        scales_double, scales_single, models_scales = _unflatten_to_gs(best_x, self.shapes)
+        n_models = self.shapes["n_models"]
 
-        attn = doubles[0::2]
-        mlp = doubles[1::2]
+        # Разворачиваем в per-model массивы: attn, mlp, single
+        attn_by_model = [np.array([a for (a, _m) in scales_double[m]], dtype=np.float32) for m in range(n_models)]
+        mlp_by_model  = [np.array([m_ for (_a, m_) in scales_double[m]], dtype=np.float32) for m in range(n_models)]
+        single_by_model = [np.array(scales_single[m], dtype=np.float32) for m in range(n_models)]
 
         alpha_dict = {
-            "double_attn": np.array(attn, dtype=np.float32),
-            "double_mlp": np.array(mlp, dtype=np.float32),
-            "single": np.array(singles, dtype=np.float32),
-            "models_scales": np.array(models, dtype=np.float32),
+            "double_attn": attn_by_model,         # список np.array по моделям
+            "double_mlp": mlp_by_model,           # список np.array по моделям
+            "single": single_by_model,            # список np.array по моделям
+            "models_scales": np.array(models_scales, dtype=np.float32),  # shape = [n_models]
         }
-        log_hist_alphas(self.writer, alpha_dict, step, prefix="alphas/")
+        log_scatter(self.writer, alpha_dict, step, prefix="alphas/")
 
         self.hist_sigma.append(float(sigma))
-        self.hist_models_scales.append(models.tolist())
+        self.hist_models_scales.append(np.asarray(models_scales, dtype=np.float32).tolist())
 
-    def _maybe_log_images(self, step: int, prompts: List[str], x: np.ndarray, tag: str = "samples/train"):
-        if not getattr(self.cfg.experiment, "save_images", False):
+    def _maybe_log_images(self, step: int, x: np.ndarray, tag: str = "samples/test"):
+        if not getattr(self.cfg.experiment, "test_dataset", False):
             return
+        prompts = get_lines(self.cfg.experiment.test_dataset)
         self._apply_x_via_pipeline(x)
         show_seed = int(getattr(self.cfg.experiment, "seed", 0)) + step + 777
-        images = self._gen_images(prompts, show_seed)
+        images = self._gen_images_batch(prompts, show_seed)
         log_images(self.writer, tag, images, step)
 
     def _checkpoint_json(self, step: int, best_fit: float, mean_fit: float, val_fit: Optional[float], best_x: np.ndarray):
-        if not getattr(self.cfg.experiment, "save_json", False):
+        if getattr(self.cfg.experiment, "save_json", None) is None:
             return
         run_dir = getattr(self.writer, "log_dir", None) or os.path.join(self.cfg.experiment.log_dir, self.cfg.experiment.name)
+        run_dir = os.path.join(run_dir, "checkpoints")
         os.makedirs(run_dir, exist_ok=True)
         payload = {
             "step": int(step),
@@ -314,7 +377,15 @@ class CMAESTrainer:
         max_gens = int(self.cfg.optimize.max_generations)
         base_seed = int(getattr(self.cfg.experiment, "seed", 0))
 
-        while not self.es.stop() and generation < max_gens:
+        ### eval orig model
+        if self.cfg.experiment.eval_orig_model:
+            orig_x = _flatten_from_transformer(self.pipeline)
+            val_score = self._eval_validation(orig_x, seed=1234)
+            for name, score in val_score.items():
+                log_scalars(self.writer, {f"val/{name}": float(score)}, generation)
+            self._maybe_log_images(generation, orig_x)
+
+        while not self.es.stop() and (generation < max_gens or max_gens < 0):
             step = generation + 1
 
             # one shared train batch per generation
@@ -322,10 +393,13 @@ class CMAESTrainer:
 
             # evaluate candidates on the same batch
             candidates = self.es.ask()
+            log_scalars(self.writer, {f"train/num_candidates": len(candidates)}, step)
             fitnesses = []
+            scores = []
             for x in candidates:
-                score = self._eval_candidate_on_batch(x, batch_prompts, seed=base_seed + generation)
-                fitnesses.append(-float(score))  # CMA-ES minimizes
+                score = self._eval_candidate_on_bucket(x, batch_prompts, seed=base_seed + generation)
+                fitnesses.append(-float(score["avg"]))  # CMA-ES minimizes
+                scores.append(score)
 
             self.es.tell(candidates, fitnesses)
 
@@ -333,33 +407,39 @@ class CMAESTrainer:
             best_idx = int(np.argmin(fitnesses))
             best_x = np.asarray(candidates[best_idx], dtype=np.float64)
             best_fit = -float(fitnesses[best_idx])
+            best_scores = scores[best_idx]
             mean_fit = -float(np.mean(fitnesses))
 
             # track best
             if best_fit > self.best_train:
                 self.best_train = best_fit
+                self.best_train_scores = best_scores
                 self.best_solution = best_x.copy()
 
             self.hist_train_best.append(best_fit)
             self.hist_train_mean.append(mean_fit)
+            self.hist_train_best_scores.append(best_scores)
 
             # logging
             self._log_step(step, best_fit, mean_fit, float(self.es.sigma), best_x)
-            self._maybe_log_images(step, batch_prompts, best_x)
 
             # validation schedule
             do_val = int(self.cfg.optimize.val_every_steps) > 0 and (step % int(self.cfg.optimize.val_every_steps) == 0 or step == max_gens)
             if do_val:
                 val_score = self._eval_validation(best_x, seed=1234)
                 self.hist_val.append(val_score)
-                log_scalars(self.writer, {"val/mean": float(val_score)}, step)
+                for name, score in val_score.items():
+                    log_scalars(self.writer, {f"val/{name}": float(score)}, step)
 
-                train_val_gap = best_fit - float(val_score)
-                if val_score > self.best_val:
-                    self.best_val = float(val_score)
-                    self.patience = 0
-                else:
-                    self.patience += 1
+                self._maybe_log_images(step, best_x)
+
+                ### overfitting checker
+                # train_val_gap = best_fit - float(val_score)
+                if val_score["avg"] > self.best_val:
+                    self.best_val = float(val_score["avg"])
+                #     self.patience = 0
+                # else:
+                #     self.patience += 1
 
                 # if self.patience >= int(self.cfg.optimize.early_stopping_patience):
                 #     self._checkpoint_json(step, best_fit, mean_fit, val_score, best_x)
@@ -368,11 +448,9 @@ class CMAESTrainer:
                 # if train_val_gap > float(self.cfg.optimize.overfitting_threshold) and self.patience >= int(self.cfg.optimize.early_stopping_patience):
                 #     self._checkpoint_json(step, best_fit, mean_fit, val_score, best_x)
                 #     break
+                self._checkpoint_json(step, best_fit, mean_fit, self.hist_val[-1]["avg"], best_x)
             else:
                 self.hist_val.append(None)
-
-            # checkpoint
-            self._checkpoint_json(step, best_fit, mean_fit, self.hist_val[-1], best_x)
 
             generation += 1
 

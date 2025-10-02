@@ -1,9 +1,16 @@
+import matplotlib.pyplot as plt
+import io
+from PIL import Image
+from datetime import datetime
 import torch
 from torch.utils.tensorboard import SummaryWriter
 import numpy as np
 
+
 def create_writer(log_dir, run_name):
-    return SummaryWriter(log_dir=f"{log_dir}/{run_name}")
+    current_time = datetime.now().strftime("%H:%M:%S_%d-%m-%Y")
+    full_path = f"{log_dir}/{run_name}_{current_time}"
+    return SummaryWriter(log_dir=full_path)
 
 def log_scalars(writer: SummaryWriter, scalars: dict, step: int, prefix: str = ""):
     for k, v in scalars.items():
@@ -15,7 +22,100 @@ def log_hist_alphas(writer: SummaryWriter, alpha_dict: dict, step: int, prefix: 
         arr = np.asarray(arr)
         writer.add_histogram(f"{prefix}{name}", arr, step)
 
-def log_images(writer: SummaryWriter, tag: str, pil_images, step: int, max_images=4):
+def log_images(writer: SummaryWriter, tag: str, pil_images, step: int, max_images=8):
     # склеивание не делаем, логируем первые N изображений поштучно
     for i, im in enumerate(pil_images[:max_images]):
         writer.add_image(f"{tag}/{i}", torch.from_numpy(np.array(im)).permute(2,0,1), step)
+
+def log_scatter(writer: "SummaryWriter", alpha_dict: dict, step: int, prefix: str):
+
+    # Ветвь для по-модельных массивов (список массивов для attn/mlp/single)
+    is_multi = isinstance(alpha_dict.get("double_attn"), (list, tuple)) \
+               and isinstance(alpha_dict.get("double_mlp"), (list, tuple)) \
+               and isinstance(alpha_dict.get("single"), (list, tuple))
+
+    colors = ['blue', 'red', 'green', 'orange', 'purple', 'brown', 'pink', 'gray', 'olive', 'cyan']
+
+    def _save_fig_to_tb(fig, tag):
+        buf = io.BytesIO()
+        fig.savefig(buf, format="png", dpi=100, bbox_inches="tight")
+        plt.close(fig)
+        buf.seek(0)
+        img = Image.open(buf).convert("RGB")
+        writer.add_image(tag, torch.from_numpy(np.array(img)).permute(2, 0, 1), step)
+
+    if is_multi:
+        attn_by_model = [np.asarray(x) for x in alpha_dict["double_attn"]]
+        mlp_by_model  = [np.asarray(x) for x in alpha_dict["double_mlp"]]
+        single_by_model = [np.asarray(x) for x in alpha_dict["single"]]
+        n_models = max(len(attn_by_model), len(mlp_by_model), len(single_by_model))
+
+        num_transformer_blocks = max((len(x) for x in attn_by_model), default=0)
+        num_single_blocks = max((len(x) for x in single_by_model), default=0)
+
+        # Отдельный график: Attention
+        fig_attn, ax1 = plt.subplots(figsize=(8, 5))
+        for m_idx in range(n_models):
+            if m_idx < len(attn_by_model):
+                a_arr = attn_by_model[m_idx]
+                ax1.scatter(range(len(a_arr)), a_arr, alpha=0.6,
+                            color=colors[m_idx % len(colors)], marker='o', label=f"Model {m_idx}")
+        ax1.set_xlabel('Block Index'); ax1.set_ylabel('W_attn Value')
+        ax1.set_title('Transformer Blocks: Attention Gate Coefficients')
+        if num_transformer_blocks > 0:
+            ax1.set_xticks(list(range(num_transformer_blocks)))
+        ax1.grid(True); ax1.legend()
+        _save_fig_to_tb(fig_attn, f"{prefix}double_attn")
+
+        # Отдельный график: MLP
+        fig_mlp, ax2 = plt.subplots(figsize=(8, 5))
+        for m_idx in range(n_models):
+            if m_idx < len(mlp_by_model):
+                m_arr = mlp_by_model[m_idx]
+                ax2.scatter(range(len(m_arr)), m_arr, alpha=0.6,
+                            color=colors[m_idx % len(colors)], marker='o', label=f"Model {m_idx}")
+        ax2.set_xlabel('Block Index'); ax2.set_ylabel('W_mlp Value')
+        ax2.set_title('Transformer Blocks: MLP Gate Coefficients')
+        if num_transformer_blocks > 0:
+            ax2.set_xticks(list(range(num_transformer_blocks)))
+        ax2.grid(True); ax2.legend()
+        _save_fig_to_tb(fig_mlp, f"{prefix}double_mlp")
+
+        # Отдельный график: Single
+        fig_single, ax3 = plt.subplots(figsize=(8, 5))
+        for m_idx in range(n_models):
+            if m_idx < len(single_by_model):
+                s_arr = single_by_model[m_idx]
+                ax3.scatter(range(len(s_arr)), s_arr, alpha=0.6,
+                            color=colors[m_idx % len(colors)], marker='o', label=f"Model {m_idx}")
+        ax3.set_xlabel('Block Index'); ax3.set_ylabel('W Value')
+        ax3.set_title('Single Blocks: Gate Coefficients')
+        if num_single_blocks > 0:
+            ax3.set_xticks(list(range(num_single_blocks)))
+        ax3.grid(True); ax3.legend()
+        _save_fig_to_tb(fig_single, f"{prefix}single")
+
+        # Отдельный график: Model scales (bar)
+        if "models_scales" in alpha_dict:
+            ms = np.asarray(alpha_dict["models_scales"])
+            fig_ms, ax = plt.subplots(figsize=(8, 5))
+            ax.bar(np.arange(len(ms)), ms, color='blue')
+            ax.set_xlabel('Model Index'); ax.set_ylabel('Scale Value')
+            ax.set_title('Model Scales'); ax.grid(True)
+            _save_fig_to_tb(fig_ms, f"{prefix}models_scales")
+
+    else:
+        # Fallback для 1D массива: каждый ключ — отдельный график
+        for name, arr in alpha_dict.items():
+            arr = np.asarray(arr)
+            fig, ax = plt.subplots(figsize=(8, 5))
+            if name == "models_scales":
+                ax.bar(np.arange(len(arr)), arr, color='blue')
+                ax.set_xlabel("Index"); ax.set_ylabel("Value")
+                ax.set_title(f"Bar plot for {name}")
+            else:
+                ax.scatter(np.arange(len(arr)), arr, c='red')
+                ax.set_xlabel("Block Index"); ax.set_ylabel("Value")
+                ax.set_title(f"Scatter plot for {name}")
+            ax.grid(True)
+            _save_fig_to_tb(fig, f"{prefix}{name}")

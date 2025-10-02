@@ -25,7 +25,6 @@ _CONFIG = config_flags.DEFINE_config_file("config", "configs/base.py", "Training
 def main(_):
 
     cfg = _CONFIG.value
-    print(cfg)
 
     if cfg.experiment.seed is not None:
         set_seed(cfg.experiment.seed)
@@ -48,7 +47,7 @@ def main(_):
     eval_reward_fn = getattr(src.rewards, 'multi_score')(cfg.device, cfg.reward_fn_eval)
 
     os.makedirs(cfg.experiment.log_dir, exist_ok=True)
-    current_time = datetime.now().strftime("%H:%M:%S_%d-%m-%Y")
+    current_time = datetime.now().strftime("%Y-%m-%d_%H:%M:%S")
     final_logdir = os.path.join(cfg.experiment.log_dir, f"{cfg.experiment.name}_{current_time}")
     os.makedirs(final_logdir, exist_ok=True)
     save_config(cfg, final_logdir)

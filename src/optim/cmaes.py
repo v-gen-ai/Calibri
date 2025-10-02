@@ -8,7 +8,7 @@ from tqdm import tqdm
 import torch
 import cma
 
-from src.utils.logging_tb import log_scalars, log_hist_alphas, log_images, log_scatter
+from src.utils.logging_tb import log_scalars, log_images, log_scatter
 from src.data.prompts import get_lines
 
 
@@ -237,12 +237,6 @@ class CMAESTrainer:
         )
         return out.images
 
-    # def _eval_candidate_on_batch(self, x: np.ndarray, prompts: List[str], seed: int) -> float:
-    #     self._apply_x_via_pipeline(x)
-    #     images = self._gen_images_batch(prompts, seed)
-    #     scores = _call_reward(self.reward_fn, images, prompts)
-    #     return _mean_score(scores)
-
     def _eval_candidate_on_bucket(self, x: np.ndarray, bucket_prompts: List[str], seed: int) -> Dict[str, float]:
         # применяем параметры кандидата
         self._apply_x_via_pipeline(x)
@@ -288,34 +282,6 @@ class CMAESTrainer:
                     total_scores[name] += score
             count += len(prompts)
         return {name: score / count for name, score in total_scores.items()}
-
-    # def _log_step(self, step: int, best_fit: float, mean_fit: float, sigma: float, best_x: np.ndarray):
-    #     scalars = {
-    #         "train/best": float(best_fit),
-    #         "train/mean": float(mean_fit),
-    #         "cmaes/sigma": float(sigma),
-    #     }
-    #     log_scalars(self.writer, scalars, step)
-
-    #     d_doubles = self.shapes["doubles"]
-    #     d_singles = self.shapes["singles"]
-    #     doubles = best_x[:d_doubles]
-    #     singles = best_x[d_doubles:d_doubles + d_singles]
-    #     models = best_x[d_doubles + d_singles:]
-
-    #     attn = doubles[0::2]
-    #     mlp = doubles[1::2]
-
-    #     alpha_dict = {
-    #         "double_attn": np.array(attn, dtype=np.float32),
-    #         "double_mlp": np.array(mlp, dtype=np.float32),
-    #         "single": np.array(singles, dtype=np.float32),
-    #         "models_scales": np.array(models, dtype=np.float32),
-    #     }
-    #     log_scatter(self.writer, alpha_dict, step, prefix="alphas/")
-
-    #     self.hist_sigma.append(float(sigma))
-    #     self.hist_models_scales.append(models.tolist())
 
     def _log_step(self, step: int, best_fit: float, mean_fit: float, sigma: float, best_x: np.ndarray):
         scalars = {
@@ -384,6 +350,7 @@ class CMAESTrainer:
             for name, score in val_score.items():
                 log_scalars(self.writer, {f"val/{name}": float(score)}, generation)
             self._maybe_log_images(generation, orig_x)
+            self._checkpoint_json(generation, -1.0, -1.0, val_score["avg"], orig_x)
 
         while not self.es.stop() and (generation < max_gens or max_gens < 0):
             step = generation + 1

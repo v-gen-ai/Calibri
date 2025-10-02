@@ -1,5 +1,6 @@
 import sys
 import os
+from pathlib import Path
 
 script_dir = os.path.dirname(os.path.abspath(__file__))
 project_root = os.path.abspath(os.path.join(script_dir, '..'))
@@ -8,12 +9,14 @@ if project_root not in sys.path:
 
 from absl import app, flags
 from ml_collections import config_flags
+import torch
 
-from src.models.flux_autoguidance import AutoGuidanceFluxPipeline
-from src.utils.config_loader import load_config_from_py
+import src.rewards
+from src.models.flux_gs import GSFluxPipeline
+from src.utils.utils import set_seed
 from src.utils.logging_tb import create_writer
 from src.data.prompts import make_loader
-from src.optim.cmaes import CMAESAlphaTrainer
+from src.optim.cmaes import CMAESTrainer
 
 _CONFIG = config_flags.DEFINE_config_file("config", "configs/base.py", "Training configuration.")
 
@@ -22,35 +25,43 @@ def main(_):
 
     cfg = _CONFIG.value
     print(cfg)
-    # if args.log_dir:
-    #     cfg.experiment.log_dir = args.log_dir
-    # cfg.data.train_prompts = args.train_prompts
-    # cfg.data.val_prompts = args.val_prompts
 
-    # torch.manual_seed(cfg.experiment.seed)
+    if cfg.experiment.seed is not None:
+        set_seed(cfg.experiment.seed)
 
-    # pipeline = AutoGuidanceFluxPipeline(
-    #     cfg.model.main_model,
-    #     cfg.model.guidance_model,
-    #     torch_dtype=cfg.model.torch_dtype,
-    #     device_map=cfg.model.device_map,
-    #     low_cpu_mem_usage=cfg.model.low_cpu_mem_usage
-    # )
+    inference_dtype = torch.float32
+    if cfg.model.dtype == "fp16":
+        inference_dtype = torch.float16
+    elif cfg.model.dtype == "bf16":
+        inference_dtype = torch.bfloat16
 
-    # os.makedirs(cfg.experiment.log_dir, exist_ok=True)
-    # writer = create_writer(cfg.experiment.log_dir, cfg.experiment.name)
+    pipeline = GSFluxPipeline(
+        device=cfg.device,
+        dtype=inference_dtype,
+        model_name=cfg.model.model_name,
+        num_models=cfg.gatescale.num_models
+    )
 
-    # train_loader = make_loader(
-    #     cfg.data.train_prompts, cfg.data.batch_size, cfg.data.num_workers, cfg.data.shuffle, cfg.data.drop_last, limit=cfg.data.limit_train
-    # )
-    # val_loader = make_loader(
-    #     cfg.data.val_prompts, cfg.data.batch_size, 0, False, False, limit=cfg.data.limit_val
-    # )
+    # prompt = "a cat playing a ball"
+    # imgs = pipeline(prompt).images
+    reward_fn = getattr(src.rewards, 'multi_score')(cfg.device, cfg.reward_fn)
+    # print(reward_fn(imgs, [prompt], None))
+    eval_reward_fn = getattr(src.rewards, 'multi_score')(cfg.device, cfg.reward_fn)
 
-    # trainer = CMAESAlphaTrainer(cfg, pipeline, writer, train_loader, val_loader)
-    # best_solution, best_train, best_val = trainer.train()
+    os.makedirs(cfg.experiment.log_dir, exist_ok=True)
+    writer = create_writer(cfg.experiment.log_dir, cfg.experiment.name)
 
-    # writer.close()
+    train_loader = make_loader(
+        cfg.data.train_dataset, cfg.data.batch_size, cfg.data.num_workers, cfg.data.shuffle, cfg.data.drop_last, limit=cfg.data.limit_train, infinite=True
+    )
+    val_loader = make_loader(
+        cfg.data.val_dataset, cfg.data.batch_size, 0, False, False, limit=cfg.data.limit_val
+    )
+
+    trainer = CMAESTrainer(cfg, pipeline, reward_fn, eval_reward_fn, writer, train_loader, val_loader)
+    best_solution, best_train, best_val = trainer.train()
+
+    writer.close()
 
 if __name__ == "__main__":
     app.run(main)

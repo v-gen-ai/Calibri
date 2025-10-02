@@ -1,5 +1,6 @@
 from torch.utils.data import Dataset, DataLoader
 
+
 class PromptDataset(Dataset):
     def __init__(self, path, limit=-1):
         with open(path, "r", encoding="utf-8") as f:
@@ -14,11 +15,25 @@ class PromptDataset(Dataset):
     def __getitem__(self, idx):
         return self.prompts[idx]
 
-def collate_prompts(batch):
-    # batch: list[str]
-    return batch  # список промптов «как есть»
+class InfiniteDataLoader:
+    """Простая бесконечная обёртка над любым DataLoader."""
+    def __init__(self, base_loader):
+        self.base_loader = base_loader
 
-def make_loader(path, batch_size, num_workers, shuffle, drop_last, limit=-1):
+    def __iter__(self):
+        while True:
+            for batch in self.base_loader:
+                yield batch
+
+def make_loader(path, batch_size, num_workers, shuffle, drop_last, limit=-1, infinite=False):
     ds = PromptDataset(path, limit=limit)
-    return DataLoader(ds, batch_size=batch_size, shuffle=shuffle, num_workers=num_workers,
-                      drop_last=drop_last, collate_fn=collate_prompts)
+    base = DataLoader(
+        ds,
+        batch_size=batch_size,
+        shuffle=shuffle,
+        num_workers=num_workers,
+        drop_last=drop_last,
+    )
+    if infinite:
+        return InfiniteDataLoader(base)
+    return base

@@ -10,7 +10,9 @@ def get_config():
     cfg.experiment.seed = 42
     cfg.experiment.log_dir = "logs"
     cfg.experiment.save_images = False  # можно включить примеры
+    cfg.experiment.test_dataset = "data/test_log.txt"  # dataset to save images on
     cfg.experiment.save_json = True
+    cfg.experiment.eval_orig_model = True
 
     cfg.model = ConfigDict()
     cfg.model.model_name = "black-forest-labs/FLUX.1-dev"
@@ -34,12 +36,13 @@ def get_config():
     cfg.optimize.blocks_bound_high = 2.0
     cfg.optimize.models_bound_low = -10.0
     cfg.optimize.models_bound_high = 10.0
+    cfg.optimize.bucket_size = 16
 
     cfg.data = ConfigDict()
     cfg.data.batch_size = 8
     cfg.data.num_workers = 2
     cfg.data.shuffle = True
-    cfg.data.drop_last = False
+    cfg.data.drop_last = True
     cfg.data.limit_train = -1
     cfg.data.limit_val = -1
 

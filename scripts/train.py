@@ -41,21 +41,34 @@ def main(_):
         model_name=cfg.model.model_name,
         num_models=cfg.gatescale.num_models
     )
+    pipeline.pipeline.set_progress_bar_config(disable=True)
 
     # prompt = "a cat playing a ball"
     # imgs = pipeline(prompt).images
     reward_fn = getattr(src.rewards, 'multi_score')(cfg.device, cfg.reward_fn)
     # print(reward_fn(imgs, [prompt], None))
-    eval_reward_fn = getattr(src.rewards, 'multi_score')(cfg.device, cfg.reward_fn)
+    eval_reward_fn = getattr(src.rewards, 'multi_score')(cfg.device, cfg.reward_fn_eval)
 
     os.makedirs(cfg.experiment.log_dir, exist_ok=True)
     writer = create_writer(cfg.experiment.log_dir, cfg.experiment.name)
 
     train_loader = make_loader(
-        cfg.data.train_dataset, cfg.data.batch_size, cfg.data.num_workers, cfg.data.shuffle, cfg.data.drop_last, limit=cfg.data.limit_train, infinite=True
+        cfg.data.train_dataset, 
+        cfg.optimize.bucket_size, 
+        cfg.data.num_workers, 
+        cfg.data.shuffle, 
+        cfg.data.drop_last, 
+        limit=cfg.data.limit_train, 
+        infinite=True
     )
     val_loader = make_loader(
-        cfg.data.val_dataset, cfg.data.batch_size, 0, False, False, limit=cfg.data.limit_val
+        cfg.data.val_dataset, 
+        cfg.data.batch_size, 
+        0, 
+        True, 
+        False, 
+        limit=cfg.data.limit_val, 
+        cut_cnt=2
     )
 
     trainer = CMAESTrainer(cfg, pipeline, reward_fn, eval_reward_fn, writer, train_loader, val_loader)

@@ -1,16 +1,14 @@
+import os
 import matplotlib.pyplot as plt
 import io
 from PIL import Image
-from datetime import datetime
 import torch
 from torch.utils.tensorboard import SummaryWriter
 import numpy as np
 
 
-def create_writer(log_dir, run_name):
-    current_time = datetime.now().strftime("%H:%M:%S_%d-%m-%Y")
-    full_path = f"{log_dir}/{run_name}_{current_time}"
-    return SummaryWriter(log_dir=full_path)
+def create_writer(log_dir):
+    return SummaryWriter(log_dir=log_dir)
 
 def log_scalars(writer: SummaryWriter, scalars: dict, step: int, prefix: str = ""):
     for k, v in scalars.items():
@@ -82,7 +80,7 @@ def log_scatter(writer: "SummaryWriter", alpha_dict: dict, step: int, prefix: st
         _save_fig_to_tb(fig_mlp, f"{prefix}double_mlp")
 
         # Отдельный график: Single
-        fig_single, ax3 = plt.subplots(figsize=(8, 5))
+        fig_single, ax3 = plt.subplots(figsize=(12, 5))
         for m_idx in range(n_models):
             if m_idx < len(single_by_model):
                 s_arr = single_by_model[m_idx]

@@ -1,6 +1,7 @@
 import sys
 import os
-from pathlib import Path
+import json
+from datetime import datetime
 
 script_dir = os.path.dirname(os.path.abspath(__file__))
 project_root = os.path.abspath(os.path.join(script_dir, '..'))
@@ -13,7 +14,7 @@ import torch
 
 import src.rewards
 from src.models.flux_gs import GSFluxPipeline
-from src.utils.utils import set_seed
+from src.utils.utils import set_seed, save_config
 from src.utils.logging_tb import create_writer
 from src.data.prompts import make_loader
 from src.optim.cmaes import CMAESTrainer
@@ -43,14 +44,15 @@ def main(_):
     )
     pipeline.pipeline.set_progress_bar_config(disable=True)
 
-    # prompt = "a cat playing a ball"
-    # imgs = pipeline(prompt).images
     reward_fn = getattr(src.rewards, 'multi_score')(cfg.device, cfg.reward_fn)
-    # print(reward_fn(imgs, [prompt], None))
     eval_reward_fn = getattr(src.rewards, 'multi_score')(cfg.device, cfg.reward_fn_eval)
 
     os.makedirs(cfg.experiment.log_dir, exist_ok=True)
-    writer = create_writer(cfg.experiment.log_dir, cfg.experiment.name)
+    current_time = datetime.now().strftime("%H:%M:%S_%d-%m-%Y")
+    final_logdir = os.path.join(cfg.experiment.log_dir, f"{cfg.experiment.name}_{current_time}")
+    os.makedirs(final_logdir, exist_ok=True)
+    save_config(cfg, final_logdir)
+    writer = create_writer(final_logdir)
 
     train_loader = make_loader(
         cfg.data.train_dataset, 

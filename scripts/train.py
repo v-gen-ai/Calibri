@@ -67,10 +67,10 @@ def main(_):
         cfg.data.val_dataset, 
         cfg.data.batch_size, 
         0, 
-        True, 
+        False, 
         False, 
         limit=cfg.data.limit_val, 
-        cut_cnt=2
+        # cut_cnt=2
     )
 
     trainer = CMAESTrainer(cfg, pipeline, reward_fn, eval_reward_fn, writer, train_loader, val_loader)

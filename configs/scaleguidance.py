@@ -8,7 +8,7 @@ def cmaes_image_reward():
     cfg.optimize.max_generations = -1
     cfg.optimize.val_every_steps = 10
     cfg.data.train_dataset = "data/t2i_compbench_train.txt"  # t2i-compbench
-    cfg.data.val_dataset = "data/t2i_compbench_val.txt"  # t2i-compbench
+    cfg.data.val_dataset = "data/t2i_compbench_val_random_crop.txt"  # t2i-compbench
     cfg.optimize.population_size = None
     cfg.reward_fn = {
         "imagereward": 1.0,
@@ -25,7 +25,7 @@ def cmaes_image_reward_2models():
     cfg.optimize.max_generations = -1
     cfg.optimize.val_every_steps = 10
     cfg.data.train_dataset = "data/t2i_compbench_train.txt"  # t2i-compbench
-    cfg.data.val_dataset = "data/t2i_compbench_val.txt"  # t2i-compbench
+    cfg.data.val_dataset = "data/t2i_compbench_val_random_crop.txt"  # t2i-compbench
     cfg.optimize.population_size = None
     cfg.reward_fn = {
         "imagereward": 1.0,

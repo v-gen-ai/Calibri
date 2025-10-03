@@ -5,7 +5,7 @@ import torch.nn as nn
 from diffusers import FluxPipeline
 
 
-def extend_transformer_with_gs(
+def extend_transformer_with_sg(
     model_transformer,
     num_models: int = 1,
     scales_double: Sequence[Sequence[tuple[float, float]]] = None,
@@ -148,13 +148,13 @@ def extend_transformer_with_gs(
     return model_transformer
 
 
-class GSFluxPipeline:
+class SGFluxPipeline:
     def __init__(self, device, dtype, model_name="black-forest-labs/FLUX.1-dev", num_models=1):
         self.pipeline = FluxPipeline.from_pretrained(
             model_name,
             torch_dtype=dtype,
         ).to(device)
-        self.pipeline.transformer = extend_transformer_with_gs(self.pipeline.transformer, num_models=num_models)
+        self.pipeline.transformer = extend_transformer_with_sg(self.pipeline.transformer, num_models=num_models)
 
     def modify_scaleguidance(
         self,
@@ -163,7 +163,7 @@ class GSFluxPipeline:
         scales_single: Sequence[Sequence[float]] = None,
         models_scales: Sequence[float] = None
     ):
-        self.pipeline.transformer = extend_transformer_with_gs(self.pipeline.transformer,
+        self.pipeline.transformer = extend_transformer_with_sg(self.pipeline.transformer,
                                                                num_models=num_models,
                                                                scales_double=scales_double,
                                                                scales_single=scales_single,

@@ -36,7 +36,7 @@ def get_config():
     cfg.optimize.blocks_bound_high = 2.0
     cfg.optimize.models_bound_low = -10.0
     cfg.optimize.models_bound_high = 10.0
-    cfg.optimize.bucket_size = 64
+    cfg.optimize.bucket_size = 16
 
     cfg.data = ConfigDict()
     cfg.data.batch_size = 8

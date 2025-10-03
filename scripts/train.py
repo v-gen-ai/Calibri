@@ -13,7 +13,7 @@ from ml_collections import config_flags
 import torch
 
 import src.rewards
-from src.models.flux_gs import GSFluxPipeline
+from src.models.flux_sg import SGFluxPipeline
 from src.utils.utils import set_seed, save_config
 from src.utils.logging_tb import create_writer
 from src.data.prompts import make_loader
@@ -35,7 +35,7 @@ def main(_):
     elif cfg.model.dtype == "bf16":
         inference_dtype = torch.bfloat16
 
-    pipeline = GSFluxPipeline(
+    pipeline = SGFluxPipeline(
         device=cfg.device,
         dtype=inference_dtype,
         model_name=cfg.model.model_name,

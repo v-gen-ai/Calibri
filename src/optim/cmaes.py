@@ -101,7 +101,7 @@ def _unflatten_to_gs(x: np.ndarray, shapes: Dict[str, int]):
             ms.append(float(singles[start + b]))
         scales_single.append(ms)
 
-    models_scales = [float(v) for v in models.tolist()]
+    models_scales = [float(v) for v in list(models)]
     return scales_double, scales_single, models_scales
 
 
@@ -192,7 +192,7 @@ class CMAESTrainer:
         )
 
         # state
-        self._train_iter = iter(self.train_loader)
+        self._train_iter = iter(self.train_loader) if self.train_loader is not None else None
         self.best_solution = x0.copy()
         self.best_train = -np.inf
         self.best_val = -np.inf
@@ -256,7 +256,7 @@ class CMAESTrainer:
         # усредняем метрики по всему bucket
         return {name: float(score) / float(count) for name, score in total_scores.items()}
 
-    def _eval_validation(self, x: np.ndarray, seed: int = 1234) -> float:
+    def _eval_validation(self, x: np.ndarray, seed: int = 1234) -> dict:
         self._apply_x_via_pipeline(x)
         # total = 0.0
         total_scores = None
@@ -264,15 +264,18 @@ class CMAESTrainer:
         gen_device = "cpu"
         for prompts in tqdm(self.val_loader, desc="Validating", total=len(self.val_loader)):
             generator = torch.Generator(device=gen_device).manual_seed(int(seed))
-            out = self.pipeline(
-                list(prompts),
-                num_inference_steps=self.gen_params["num_inference_steps"],
-                guidance_scale=self.gen_params["guidance_scale"],
-                height=self.gen_params["height"],
-                width=self.gen_params["width"],
-                generator=generator,
-            )
+            with torch.inference_mode():
+                out = self.pipeline(
+                    list(prompts),
+                    num_inference_steps=self.gen_params["num_inference_steps"],
+                    guidance_scale=self.gen_params["guidance_scale"],
+                    height=self.gen_params["height"],
+                    width=self.gen_params["width"],
+                    generator=generator,
+                )
             images = out.images
+            torch.cuda.synchronize()
+            torch.cuda.empty_cache()
             scores = _call_reward(self.eval_reward_fn, images, list(prompts))
             sum_scores = _mean_score(scores, mode="sum")
             if total_scores is None:
@@ -331,7 +334,7 @@ class CMAESTrainer:
             "train_best": float(best_fit),
             "train_mean": float(mean_fit),
             "val": None if val_fit is None else float(val_fit),
-            "solution": [float(v) for v in best_x.tolist()],
+            "solution": [float(v) for v in list(best_x)],
             "shapes": self.shapes,
             "timestamp": int(time.time()),
         }

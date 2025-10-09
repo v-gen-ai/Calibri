@@ -19,3 +19,22 @@ class ImageRewardScorer(torch.nn.Module):
             _, reward = self.model.inference_rank(prompt, [image])
             rewards.append(reward)
         return rewards
+
+# Usage example
+def main():
+    scorer = ImageRewardScorer(
+        device="cuda",
+        dtype=torch.float32
+    )
+
+    images=[
+    "astronaut.jpg",
+    ]
+    pil_images = [Image.open(img) for img in images]
+    prompts=[
+        'A astronaut’s glove floating in zero-g with "NASA 2049" on the wrist',
+    ]
+    print(scorer(prompts, pil_images))
+
+if __name__ == "__main__":
+    main()

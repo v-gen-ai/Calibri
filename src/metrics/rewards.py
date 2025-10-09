@@ -3,7 +3,6 @@ import io
 import numpy as np
 import torch
 from collections import defaultdict
-from tqdm import tqdm
 
 def jpeg_incompressibility():
     def _fn(images, prompts, metadata):
@@ -79,7 +78,7 @@ def image_similarity_score(device):
     return _fn
 
 def pickscore_score(device):
-    from src.metrics.pickscore_scorer import PickScoreScorer
+    from flow_grpo.pickscore_scorer import PickScoreScorer
 
     scorer = PickScoreScorer(dtype=torch.float32, device=device)
 
@@ -94,7 +93,7 @@ def pickscore_score(device):
     return _fn
 
 def imagereward_score(device):
-    from src.metrics.imagereward_scorer import ImageRewardScorer
+    from flow_grpo.imagereward_scorer import ImageRewardScorer
 
     scorer = ImageRewardScorer(dtype=torch.float32, device=device)
 
@@ -110,7 +109,7 @@ def imagereward_score(device):
     return _fn
 
 def qwenvl_score(device):
-    from src.metrics.qwenvl import QwenVLScorer
+    from flow_grpo.qwenvl import QwenVLScorer
 
     scorer = QwenVLScorer(dtype=torch.bfloat16, device=device)
 
@@ -127,7 +126,7 @@ def qwenvl_score(device):
 
     
 def ocr_score(device):
-    from src.metrics.ocr import OcrScorer
+    from flow_grpo.ocr import OcrScorer
 
     scorer = OcrScorer()
 
@@ -142,7 +141,7 @@ def ocr_score(device):
     return _fn
 
 def video_ocr_score(device):
-    from src.metrics.ocr import OcrScorer_video_or_image
+    from flow_grpo.ocr import OcrScorer_video_or_image
 
     scorer = OcrScorer_video_or_image()
 
@@ -408,109 +407,6 @@ def unifiedreward_score_sglang(device):
     
     return _fn
 
-
-def hpsv3score(device):
-    """
-    In-proc HPSv3 scorer (использовать только если зависимости HPSv3 стоят в текущем env).
-    Возвращает функцию fn(images, prompts, metadata) -> (scores, {})
-    """
-    try:
-        from PIL import Image
-        import torch
-        from hpsv3 import HPSv3RewardInferencer
-    except Exception as e:
-        raise ImportError("HPSv3 not available in this environment. Use hpsv3score_remote instead.") from e
-
-    inferencer = HPSv3RewardInferencer(device=str(device))
-
-    def fn(images, prompts, metadata=None):
-        # Приведение входа к списку PIL.Image
-        pil_images = []
-        if isinstance(images, torch.Tensor):
-            # images: NCHW float in [0,1] или [0,255]
-            imgs = (images * 255.0 if images.dtype.is_floating_point else images).round().clamp(0, 255) \
-                    .to(torch.uint8).cpu().numpy()
-            # NCHW -> NHWC
-            imgs = imgs.transpose(0, 2, 3, 1)
-            pil_images = [Image.fromarray(im) for im in imgs]
-        else:
-            # Oжидаем список PIL.Image / np.ndarray
-            pil_images = [im if isinstance(im, Image.Image) else Image.fromarray(im) for im in images]
-
-        # Вызов HPSv3
-        scores = inferencer.reward(prompts, image_paths=pil_images)
-        return scores, {}
-    return fn
-
-
-def hpsv3score_remote(device, url=None):
-    """
-    Remote HPSv3 scorer: общается с отдельным HTTP-сервисом в окружении HPSv3.
-    URL можно переопределить через env HPSV3_URL или аргументом.
-    Возвращает функцию fn(images, prompts, metadata) -> (scores, {})
-    """
-    import os
-    import io
-    import pickle
-    import numpy as np
-    import requests
-    from requests.adapters import HTTPAdapter, Retry
-    from PIL import Image
-    import torch
-
-    url = url or os.environ.get("HPSV3_URL", "http://127.0.0.1:18087")
-    batch_size = 8
-
-    sess = requests.Session()
-    retries = Retry(total=1000, backoff_factor=1, status_forcelist=[500], allowed_methods=False)
-    sess.mount("http://", HTTPAdapter(max_retries=retries))
-
-    def _to_pil_list(images):
-        if isinstance(images, torch.Tensor):
-            arr = (images * 255.0 if images.dtype.is_floating_point else images).round().clamp(0, 255) \
-                    .to(torch.uint8).cpu().numpy()
-            arr = arr.transpose(0, 2, 3, 1)  # NCHW -> NHWC
-            return [Image.fromarray(im) for im in arr]
-        else:
-            return [im if isinstance(im, Image.Image) else Image.fromarray(im) for im in images]
-
-    def fn(images, prompts, metadata=None):
-        torch.cuda.empty_cache()
-        pil_images = _to_pil_list(images)
-        all_scores = []
-
-        # батчевка для экономии памяти и стабильности
-        for i in range(0, len(pil_images), batch_size):
-            imgs = pil_images[i:i+batch_size]
-            prms = prompts[i:i+batch_size]
-
-            # JPEG-компрессия
-            jpeg_images = []
-            for img in imgs:
-                buf = io.BytesIO()
-                img.save(buf, format="JPEG", quality=95)
-                jpeg_images.append(buf.getvalue())
-
-            payload = {"images": jpeg_images, "prompts": prms}
-            data_bytes = pickle.dumps(payload)
-
-            resp = sess.post(url, data=data_bytes, timeout=600)
-            # resp.raise_for_status()
-            if resp.status_code != 200:
-                # вытащим текст ошибки, который сервер упаковал pickle'ом
-                err = None
-                try:
-                    err = pickle.loads(resp.content).get("error")
-                except Exception:
-                    err = f"raw={resp.content[:200]!r}"
-                raise RuntimeError(f"HPSv3 remote HTTP {resp.status_code}: {err}")
-            result = pickle.loads(resp.content)
-            all_scores.extend(result["scores"])
-
-        return all_scores, {}
-    return fn
-
-
 def multi_score(device, score_dict):
     score_functions = {
         "deqa": deqa_score_remote,
@@ -525,7 +421,6 @@ def multi_score(device, score_dict):
         "geneval": geneval_score,
         "clipscore": clip_score,
         "image_similarity": image_similarity_score,
-        "hpsv3": hpsv3score_remote
     }
     score_fns={}
     for score_name, weight in score_dict.items():

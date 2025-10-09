@@ -127,7 +127,10 @@ def extend_transformer_with_sg(
         for idx_model in range(len(self.models_scales)):
             scale = self.models_scales[idx_model]
             self._register_hooks(idx_model)
-            tmp_res = self._original_forward(*args, **kwargs)
+            try:
+                tmp_res = self._original_forward(*args, **kwargs)
+            finally:
+                self._remove_hooks()
             if isinstance(tmp_res, tuple):
                 scaled = tuple(scale * t if torch.is_tensor(t) else t for t in tmp_res)
             else:
@@ -139,7 +142,6 @@ def extend_transformer_with_sg(
                     result = tuple((r + s) if torch.is_tensor(r) else r for r, s in zip(result, scaled))
                 else:
                     result = result + scaled
-            self._remove_hooks()
         return result
 
     model_transformer._register_hooks = types.MethodType(_register_hooks, model_transformer)

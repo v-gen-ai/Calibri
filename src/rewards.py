@@ -5,6 +5,9 @@ import torch
 from collections import defaultdict
 from tqdm import tqdm
 
+from src.utils.utils import to_pil_list
+
+
 def jpeg_incompressibility():
     def _fn(images, prompts, metadata):
         if isinstance(images, torch.Tensor):
@@ -125,7 +128,6 @@ def qwenvl_score(device):
 
     return _fn
 
-    
 def ocr_score(device):
     from src.metrics.ocr import OcrScorer
 
@@ -409,6 +411,130 @@ def unifiedreward_score_sglang(device):
     return _fn
 
 
+def qalign_score(device):
+    """
+    In-proc Q-Align scorer.
+    Возвращает функцию fn(images, prompts, metadata) -> (scores, {}).
+    metadata может содержать:
+      - qalign_task: "quality" или "aesthetics" (по умолчанию "quality")
+      - qalign_input: "image" или "video" (по умолчанию "image")
+    """
+    import os
+    import torch
+    from transformers import AutoModelForCausalLM
+    from src.utils.utils import to_pil_list  # уже есть в окружении
+
+    dtype = torch.float16
+
+    try:
+        model = AutoModelForCausalLM.from_pretrained(
+            "q-future/one-align",
+            trust_remote_code=True,
+            torch_dtype=dtype,
+            device_map=str(device),
+        ).eval()
+    except Exception as e:
+        raise ImportError(
+            "Q-Align model is not available in this environment. "
+            "Consider using qalign_score_remote with a running HTTP service."
+        ) from e
+
+    def fn(images, prompts, metadata=None):
+        # prompts не требуются, но сохраняем сигнатуру совместимой
+        pil_images = to_pil_list(images)
+        if len(pil_images) == 0:
+            return [], {}
+        md = metadata or {}
+        task = md.get("qalign_task", "quality")     # "quality" | "aesthetics"
+        input_type = md.get("qalign_input", "image")  # "image" | "video"
+
+        import torch
+        with torch.inference_mode():
+            out = model.score(pil_images, task_=task, input_=input_type)
+        # Приводим к списку чисел
+        try:
+            if isinstance(out, torch.Tensor):
+                scores = out.detach().cpu().tolist()
+            elif hasattr(out, "tolist"):
+                scores = out.tolist()
+            else:
+                scores = [float(x) for x in out]
+        except Exception:
+            scores = [float(x) for x in out]
+
+        return scores, {}
+
+    return fn
+
+
+def qalign_score_remote(device, url=None):
+    """
+    Remote Q-Align scorer (HTTP).
+    URL из env QALIGN_URL либо аргумента.
+    Возвращает fn(images, prompts, metadata) -> (scores, {}).
+    metadata:
+      - qalign_task: "quality" | "aesthetics" (default "quality")
+      - qalign_input: "image" | "video" (default "image")
+    Серверный ответ: pickle.dumps({"scores": List[float]})
+    """
+    import os
+    import io
+    import pickle
+    import requests
+    from requests.adapters import HTTPAdapter, Retry
+    from PIL import Image
+    import torch
+    import numpy as np
+
+    from src.utils.utils import to_pil_list
+
+    url = url or os.environ.get("QALIGN_URL", "http://127.0.0.1:18088")
+    batch_size = int(os.environ.get("QALIGN_BATCH", "8"))
+
+    sess = requests.Session()
+    retries = Retry(total=1000, backoff_factor=1, status_forcelist=[500], allowed_methods=False)
+    sess.mount("http://", HTTPAdapter(max_retries=retries))
+
+    def fn(images, prompts, metadata=None):
+        torch.cuda.empty_cache()
+        pil_images = to_pil_list(images)
+        md = metadata or {}
+        task = md.get("qalign_task", "quality")
+        input_type = md.get("qalign_input", "image")
+
+        all_scores = []
+        for i in range(0, len(pil_images), batch_size):
+            imgs = pil_images[i:i + batch_size]
+
+            jpeg_images = []
+            for img in imgs:
+                buf = io.BytesIO()
+                img.save(buf, format="JPEG", quality=95)
+                jpeg_images.append(buf.getvalue())
+
+            payload = {
+                "images": jpeg_images,
+                "task": task,
+                "input": input_type,
+                # "prompts": prompts[i:i+batch_size],  # опционально, не используется моделью
+            }
+            data = pickle.dumps(payload)
+
+            resp = sess.post(url, data=data, timeout=600)
+            if resp.status_code != 200:
+                err = None
+                try:
+                    err = pickle.loads(resp.content).get("error")
+                except Exception:
+                    err = f"raw={resp.content[:200]!r}"
+                raise RuntimeError(f"Q-Align remote HTTP {resp.status_code}: {err}")
+
+            result = pickle.loads(resp.content)
+            all_scores.extend(result["scores"])
+        return all_scores, {}
+    return fn
+
+
 def hpsv3score(device):
     """
     In-proc HPSv3 scorer (использовать только если зависимости HPSv3 стоят в текущем env).
@@ -424,21 +550,9 @@ def hpsv3score(device):
     inferencer = HPSv3RewardInferencer(device=str(device))
 
     def fn(images, prompts, metadata=None):
-        # Приведение входа к списку PIL.Image
-        pil_images = []
-        if isinstance(images, torch.Tensor):
-            # images: NCHW float in [0,1] или [0,255]
-            imgs = (images * 255.0 if images.dtype.is_floating_point else images).round().clamp(0, 255) \
-                    .to(torch.uint8).cpu().numpy()
-            # NCHW -> NHWC
-            imgs = imgs.transpose(0, 2, 3, 1)
-            pil_images = [Image.fromarray(im) for im in imgs]
-        else:
-            # Oжидаем список PIL.Image / np.ndarray
-            pil_images = [im if isinstance(im, Image.Image) else Image.fromarray(im) for im in images]
-
-        # Вызов HPSv3
-        scores = inferencer.reward(prompts, image_paths=pil_images)
+        pil_images = to_pil_list(images)
+        scores = inferencer.reward(prompts=prompts, image_paths=pil_images)
+        scores = [reward[0].item() for reward in scores]
         return scores, {}
     return fn
 
@@ -465,18 +579,18 @@ def hpsv3score_remote(device, url=None):
     retries = Retry(total=1000, backoff_factor=1, status_forcelist=[500], allowed_methods=False)
     sess.mount("http://", HTTPAdapter(max_retries=retries))
 
-    def _to_pil_list(images):
-        if isinstance(images, torch.Tensor):
-            arr = (images * 255.0 if images.dtype.is_floating_point else images).round().clamp(0, 255) \
-                    .to(torch.uint8).cpu().numpy()
-            arr = arr.transpose(0, 2, 3, 1)  # NCHW -> NHWC
-            return [Image.fromarray(im) for im in arr]
-        else:
-            return [im if isinstance(im, Image.Image) else Image.fromarray(im) for im in images]
+    # def _to_pil_list(images):
+    #     if isinstance(images, torch.Tensor):
+    #         arr = (images * 255.0 if images.dtype.is_floating_point else images).round().clamp(0, 255) \
+    #                 .to(torch.uint8).cpu().numpy()
+    #         arr = arr.transpose(0, 2, 3, 1)  # NCHW -> NHWC
+    #         return [Image.fromarray(im) for im in arr]
+    #     else:
+    #         return [im if isinstance(im, Image.Image) else Image.fromarray(im) for im in images]
 
     def fn(images, prompts, metadata=None):
         torch.cuda.empty_cache()
-        pil_images = _to_pil_list(images)
+        pil_images = to_pil_list(images)
         all_scores = []
 
         # батчевка для экономии памяти и стабильности
@@ -525,7 +639,10 @@ def multi_score(device, score_dict):
         "geneval": geneval_score,
         "clipscore": clip_score,
         "image_similarity": image_similarity_score,
-        "hpsv3": hpsv3score_remote
+        "hpsv3": hpsv3score,
+        "hpsv3_remote": hpsv3score_remote,
+        "qalign": qalign_score,
+        "qalign_remote": qalign_score_remote
     }
     score_fns={}
     for score_name, weight in score_dict.items():

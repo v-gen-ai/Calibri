@@ -3,7 +3,7 @@ from ml_collections import ConfigDict
 
 def get_config():
     cfg = ConfigDict()
-    cfg.device = "cuda"
+    cfg.device = "cuda:0"
 
     cfg.experiment = ConfigDict()
     cfg.experiment.name = "flux_autoguidance_cmaes"
@@ -39,7 +39,7 @@ def get_config():
     cfg.optimize.bucket_size = 16
 
     cfg.data = ConfigDict()
-    cfg.data.batch_size = 8
+    cfg.data.batch_size = 4
     cfg.data.num_workers = 2
     cfg.data.shuffle = True
     cfg.data.drop_last = True

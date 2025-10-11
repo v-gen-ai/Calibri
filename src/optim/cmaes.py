@@ -7,8 +7,10 @@ import numpy as np
 from tqdm import tqdm
 import torch
 import cma
+from PIL import Image
 
 from src.utils.logging_tb import log_scalars, log_images, log_scatter
+from src.utils.utils import to_pil_list, call_reward, mean_score
 from src.data.prompts import get_lines
 
 
@@ -105,39 +107,9 @@ def _unflatten_to_gs(x: np.ndarray, shapes: Dict[str, int]):
     return scales_double, scales_single, models_scales
 
 
-def _mean_score(scores, mode="mean") -> float:
-    res_scores = {}
-    for name, score_seq in scores.items():
-        if score_seq is None:
-            res_scores[name] = -np.inf
-        if torch.is_tensor(score_seq):
-            if score_seq.numel() == 0:
-                res_scores[name] = -np.inf
-            if mode == "mean":
-                res_scores[name] = float(score_seq.float().mean().item())
-            elif mode == "sum":
-                res_scores[name] = float(score_seq.float().sum().item())
-        else:
-            if len(score_seq) == 0:
-                res_scores[name] = -np.inf
-            if mode == "mean":
-                res_scores[name] = float(np.mean([float(s) for s in score_seq]))
-            elif mode == "sum":
-                res_scores[name] = float(np.sum([float(s) for s in score_seq]))
-    return res_scores
-
-
-def _call_reward(fn, images, prompts):
-    # Унифицируем контракт: всегда возвращаем только список/массив числовых scores
-    try:
-        out = fn(images, prompts, None)
-    except TypeError:
-        out = fn(images, prompts)
-    return out[0]
-
 
 class CMAESTrainer:
-    def __init__(self, cfg, pipeline, reward_fn, eval_reward_fn, writer, train_loader, val_loader):
+    def __init__(self, cfg, pipeline, reward_fn, eval_reward_fn, writer, train_loader, val_loader, logdir=None):
         self.cfg = cfg
         self.pipeline = pipeline  # GSFluxPipeline
         self.reward_fn = reward_fn
@@ -145,6 +117,7 @@ class CMAESTrainer:
         self.writer = writer
         self.train_loader = train_loader
         self.val_loader = val_loader
+        self.logdir = logdir
 
         self.device = _get_device(cfg)
         self.gen_params = _gen_params(cfg)
@@ -245,8 +218,8 @@ class CMAESTrainer:
         micro_bs = int(self.cfg.data.batch_size)
         for mini in _iter_chunks(bucket_prompts, micro_bs):
             images = self._gen_images_batch(list(mini), seed)
-            scores = _call_reward(self.reward_fn, images, list(mini))
-            sum_scores = _mean_score(scores, mode="sum")
+            scores = call_reward(self.reward_fn, images, list(mini))
+            sum_scores = mean_score(scores, mode="sum")
             if total_scores is None:
                 total_scores = sum_scores
             else:
@@ -256,11 +229,18 @@ class CMAESTrainer:
         # усредняем метрики по всему bucket
         return {name: float(score) / float(count) for name, score in total_scores.items()}
 
-    def _eval_validation(self, x: np.ndarray, seed: int = 1234) -> dict:
+    def _eval_validation(self,
+                         x: np.ndarray,
+                         seed: int = 1234,
+                         save_dir: str | None = None,
+                         save_images: bool = False,
+                         save_format: str = "png",
+                         save_limit: int | None = None,) -> dict | None:
         self._apply_x_via_pipeline(x)
         # total = 0.0
         total_scores = None
         count = 0
+        global_idx = 0
         gen_device = "cpu"
         for prompts in tqdm(self.val_loader, desc="Validating", total=len(self.val_loader)):
             generator = torch.Generator(device=gen_device).manual_seed(int(seed))
@@ -274,17 +254,30 @@ class CMAESTrainer:
                     generator=generator,
                 )
             images = out.images
-            torch.cuda.synchronize()
-            torch.cuda.empty_cache()
-            scores = _call_reward(self.eval_reward_fn, images, list(prompts))
-            sum_scores = _mean_score(scores, mode="sum")
-            if total_scores is None:
-                total_scores = sum_scores
-            else:
-                for name, score in sum_scores.items():
-                    total_scores[name] += score
+
+            if save_images and save_dir is not None:
+                os.makedirs(save_dir, exist_ok=True)
+                pil_images = to_pil_list(images)
+                for im, prompt in zip(pil_images, list(prompts)):
+                    if save_limit is not None and global_idx >= save_limit:
+                        break
+                    fname = f"{global_idx:06d}.{save_format}"
+                    im.save(os.path.join(save_dir, fname), format=save_format.upper())
+                    global_idx += 1
+
+            if self.eval_reward_fn:
+                scores = call_reward(self.eval_reward_fn, images, list(prompts))
+                sum_scores = mean_score(scores, mode="sum")
+                if total_scores is None:
+                    total_scores = sum_scores
+                else:
+                    for name, score in sum_scores.items():
+                        total_scores[name] += score
             count += len(prompts)
-        return {name: score / count for name, score in total_scores.items()}
+        if self.eval_reward_fn:
+            return {name: score / count for name, score in total_scores.items()}
+        else:
+            return None
 
     def _log_step(self, step: int, best_fit: float, mean_fit: float, sigma: float, best_x: np.ndarray):
         scalars = {
@@ -349,7 +342,10 @@ class CMAESTrainer:
         ### eval orig model
         if self.cfg.experiment.eval_orig_model:
             orig_x = _flatten_from_transformer(self.pipeline)
-            val_score = self._eval_validation(orig_x, seed=1234)
+            val_score = self._eval_validation(orig_x, 
+                                              save_dir=os.path.join(self.logdir, "eval", f"step_{generation}"), 
+                                              save_images=getattr(self.cfg.data, "save_eval_imgs", None),
+                                              seed=1234)
             for name, score in val_score.items():
                 log_scalars(self.writer, {f"val/{name}": float(score)}, generation)
             self._maybe_log_images(generation, orig_x)
@@ -396,7 +392,11 @@ class CMAESTrainer:
             # validation schedule
             do_val = int(self.cfg.optimize.val_every_steps) > 0 and (step % int(self.cfg.optimize.val_every_steps) == 0 or step == max_gens)
             if do_val:
-                val_score = self._eval_validation(best_x, seed=1234)
+                val_score = self._eval_validation(best_x, 
+                                                  save_dir=os.path.join(self.logdir, "eval", f"step_{step}"), 
+                                                  save_images=getattr(self.cfg.data, "save_eval_imgs", None),
+                                                  seed=1234)
+                
                 self.hist_val.append(val_score)
                 for name, score in val_score.items():
                     log_scalars(self.writer, {f"val/{name}": float(score)}, step)

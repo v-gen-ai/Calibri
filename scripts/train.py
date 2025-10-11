@@ -72,7 +72,7 @@ def main(_):
         # cut_cnt=2
     )
 
-    trainer = CMAESTrainer(cfg, pipeline, reward_fn, eval_reward_fn, writer, train_loader, val_loader)
+    trainer = CMAESTrainer(cfg, pipeline, reward_fn, eval_reward_fn, writer, train_loader, val_loader, logdir=final_logdir)
     best_solution, best_train, best_val = trainer.train()
 
     writer.close()

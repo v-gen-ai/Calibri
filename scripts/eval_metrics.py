@@ -1,12 +1,11 @@
 import os
 import sys
 import re
-import json
 import csv
-import argparse
-import numpy as np
 import matplotlib.pyplot as plt
 from tqdm import tqdm
+from pathlib import Path
+from PIL import Image
 
 script_dir = os.path.dirname(os.path.abspath(__file__))
 project_root = os.path.abspath(os.path.join(script_dir, '..'))
@@ -18,113 +17,108 @@ from absl import app, flags
 from ml_collections import config_flags
 
 # project imports
-from src.models.flux_sg import SGFluxPipeline
-from src.utils.utils import set_seed
-from src.data.prompts import make_loader
-from src.optim.cmaes import CMAESTrainer  # используем eval_validation и shapes/flatten
+from src.utils.utils import set_seed, call_reward, mean_score
 import src.rewards as rewards
 
 CONFIG = config_flags.DEFINE_config_file("config", default="configs/scaleguidance.py:cmaes_image_reward",
                                          help_string="Training configuration to reuse for eval")
 
+
+def natural_sort_key(p: Path):
+    # Natural sort by splitting digits and text
+    s = p.name
+    return [int(t) if t.isdigit() else t.lower() for t in re.split(r'(\d+)', s)]
+
+
+def list_step_dirs(out_dir: Path):
+    step_dirs = []
+    for p in out_dir.iterdir():
+        if p.is_dir():
+            m = re.match(r"step_(\d+)$", p.name)
+            if m:
+                step_dirs.append((int(m.group(1)), p))
+    step_dirs.sort(key=lambda x: x[0])
+    return step_dirs
+
+
+def read_val_prompts(path: str):
+    with open(path, "r", encoding="utf-8") as f:
+        lines = [ln.strip() for ln in f if ln.strip()]
+    return lines
+
+
 def main(_):
 
     log_dir = "/home/jovyan/sobolev/ii/danil/scaleguidance/evolve/logs/cmaes_imgr_2025-10-03_03:05:29"
+    out_dir = os.path.join(log_dir, "eval")
+    out_path = Path(out_dir)
+    if not out_path.exists():
+        raise FileNotFoundError(f"Not found: {out_dir}")
 
     cfg = CONFIG.value
-    if cfg.experiment.seed is not None:
+    if getattr(cfg.experiment, "seed", None) is not None:
         set_seed(cfg.experiment.seed)
-
-    # инициализация пайплайна
-    infer_dtype = torch.float32
-    if getattr(cfg.model, "dtype", "fp32") == "fp16":
-        infer_dtype = torch.float16
-    elif getattr(cfg.model, "dtype", "fp32") == "bf16":
-        infer_dtype = torch.bfloat16
-
-    pipeline = SGFluxPipeline(
-        device=cfg.device,
-        dtype=infer_dtype,
-        model_name=cfg.model.model_name,
-        num_models=cfg.scaleguidance.num_models
-    )
-    pipeline.pipeline.set_progress_bar_config(disable=True)
 
     # готовим eval_reward_fn: либо из конфига, либо перезаписываем под одну метрику
     scoredict = cfg.reward_fn_eval
-
     eval_reward_fn = rewards.multi_score(cfg.device, scoredict)
 
-    # вал-даталоадер
-    val_loader = make_loader(
-        cfg.data.val_dataset, 
-        8, 
-        0, 
-        False, 
-        False, 
-        limit=cfg.data.limit_val, 
-        cut_cnt=2
-    )
+    val_prompts = read_val_prompts(cfg.data.val_dataset)
+    num_prompts = len(val_prompts)
 
-    # тренер только ради eval_validation и форматов вектора
-    trainer = CMAESTrainer(cfg, pipeline, reward_fn=None, eval_reward_fn=eval_reward_fn,
-                           writer=None, train_loader=None, val_loader=val_loader)
+    step_dirs = list_step_dirs(out_path)
 
-    # каталог чекпоинтов
-    ckpt_dir = os.path.join(log_dir, "checkpoints")
-    if not os.path.isdir(ckpt_dir):
-        raise FileNotFoundError(f"No checkpoints dir: {ckpt_dir}")
-
-    # собираем все json чекпоинты
-    ckpts = []
-    for fn in os.listdir(ckpt_dir):
-        if fn.endswith(".json"):
-            path = os.path.join(ckpt_dir, fn)
-            with open(path, "r", encoding="utf-8") as f:
-                payload = json.load(f)
-            # пытаемся извлечь step (из имени или из payload)
-            m = re.search(r"step(\d+)", fn)
-            step = int(m.group(1)) if m else int(payload.get("step", -1))
-            sol = np.asarray(payload["solution"], dtype=np.float64)
-            ckpts.append((step, path, sol))
-
-    ckpts.sort(key=lambda x: x[0])
-    ckpts = ckpts[:10] + ckpts[10::2]
-
-    # прогоняем валидацию
     rows = []
-    out_dir = os.path.join(log_dir, "eval")
-    os.makedirs(out_dir, exist_ok=True)
-    for step, path, sol in tqdm(ckpts):
-        vals = trainer._eval_validation(sol, seed=cfg.experiment.seed)  # dict[name] -> float
+    batch_size = cfg.data.batch_size
+    for step, step_dir in tqdm(step_dirs, desc="Evaluating steps"):
+        images = []
+        # print(len(sorted(list(step_dir.iterdir()))))
+        for image_path in sorted(list(step_dir.iterdir())):
+            img = Image.open(image_path)
+            images.append(img)
+        
+        total_scores = None
+        
+        for i in tqdm(range(0, num_prompts, batch_size), desc="Evaluating in batches"):
+            prompts_batch = val_prompts[i:i+batch_size]
+            images_batch = images[i:i+batch_size]
+            scores = call_reward(eval_reward_fn, images_batch, prompts_batch)
+            sum_scores = mean_score(scores, mode="sum")
+            if total_scores is None:
+                total_scores = sum_scores
+            else:
+                for name, score in sum_scores.items():
+                    total_scores[name] += score
+        
+        metrics_step = {name: score / len(val_prompts) for name, score in total_scores.items()}
+
         row = {"step": step}
-        for metric_key in scoredict:
-            row[metric_key] = vals[metric_key]
-            print(f"step={step} {metric_key}={vals[metric_key]}")
-
-            # график
-            steps = [r["step"] for r in rows]
-            metrics = [r[metric_key] for r in rows]
-            plt.figure(figsize=(7, 4))
-            plt.plot(steps, metrics, marker="o")
-            plt.xlabel("step")
-            plt.ylabel(metric_key)
-            plt.title(f"val {metric_key} over checkpoints")
-            plt.grid(True, alpha=0.3)
-            png_path = os.path.join(out_dir, f"val_{metric_key}.png")
-            plt.tight_layout()
-            plt.savefig(png_path, dpi=150)
-
+        row.update(metrics_step)
         rows.append(row)
-        csv_path = os.path.join(out_dir, f"val.csv")
+
+        csv_path = out_path / "val.csv"
+        fieldnames = ["step"] + list(metrics_step.keys())
         with open(csv_path, "w", newline="", encoding="utf-8") as f:
-            w = csv.DictWriter(f, fieldnames=["step", *list(scoredict.keys())])
+            w = csv.DictWriter(f, fieldnames=fieldnames)
             w.writeheader()
             for r in rows:
                 w.writerow(r)
-
         print(f"Saved: {csv_path}")
-        print(f"Saved: {png_path}")
+
+        steps = [r["step"] for r in rows]
+        for metric_key in metrics_step.keys():
+            ys = [float(r[metric_key]) for r in rows]
+            plt.figure(figsize=(7, 4))
+            plt.plot(steps, ys, marker="o")
+            plt.xlabel("step")
+            plt.ylabel(metric_key)
+            plt.title(f"val {metric_key} over checkpoints")
+            plt.grid(True, alpha=0.5)
+            png_path = out_path / f"val_{metric_key}.png"
+            plt.tight_layout()
+            plt.savefig(png_path.as_posix(), dpi=150)
+            plt.close()
+            print(f"Saved: {png_path}")
 
 if __name__ == "__main__":
     app.run(main)

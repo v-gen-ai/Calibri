@@ -109,10 +109,10 @@ def cmaes_hpsv3_2models():
     cfg.experiment.name = "cmaes_hpsv3_2models"
     cfg.scaleguidance.num_models = 2
     cfg.optimize.max_generations = -1
-    cfg.optimize.val_every_steps = 10
+    cfg.optimize.val_every_steps = 1
     cfg.data.train_dataset = "data/t2i_compbench_train.txt"  # t2i-compbench
     cfg.data.val_dataset = "data/t2i_compbench_val_random_crop.txt"  # t2i-compbench
-    cfg.optimize.population_size = None
+    cfg.optimize.population_size = 2
     cfg.data.save_eval_imgs = True
     cfg.reward_fn = {
         "hpsv3_remote": 1.0,

@@ -44,7 +44,7 @@ def main(_):
         model_name=cfg.model.model_name,
         num_models=cfg.scaleguidance.num_models
     )
-    # pipeline.pipeline.set_progress_bar_config(disable=True)
+    pipeline.pipeline.set_progress_bar_config(disable=True)
 
     reward_fn = getattr(src.rewards, 'multi_score')(cfg.device, cfg.reward_fn)
     eval_reward_fn = getattr(src.rewards, 'multi_score')(cfg.device, cfg.reward_fn_eval)
@@ -72,7 +72,7 @@ def main(_):
         False, 
         False, 
         limit=cfg.data.limit_val, 
-        cut_cnt=3
+        cut_cnt=1
     )
 
     trainer = CMAESTrainer(

@@ -1,0 +1,11 @@
+compute_environment: LOCAL_MACHINE
+distributed_type: MULTI_GPU
+num_machines: 1
+machine_rank: 0
+num_processes: 2
+mixed_precision: bf16
+use_cpu: false
+main_process_port: 29500
+main_training_function: main
+fsdp_config: {}
+deepspeed_config: {}

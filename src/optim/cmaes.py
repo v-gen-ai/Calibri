@@ -108,7 +108,6 @@ def _unflatten_to_gs(x: np.ndarray, shapes: Dict[str, int]):
     return scales_double, scales_single, models_scales
 
 
-
 class CMAESTrainer:
     def __init__(self, cfg, pipeline, reward_fn, eval_reward_fn, writer, 
                  train_loader, val_loader, logdir=None, accelerator=None):
@@ -259,31 +258,49 @@ class CMAESTrainer:
         )
         return out.images
 
+    # def _eval_candidate_on_bucket(self, x: np.ndarray, bucket_prompts: List[str], seed: int) -> Dict[str, float]:
+    #     self._apply_x_via_pipeline(x)
+    #     total_scores = None
+    #     total_count = 0
+    #     micro_bs = int(self.cfg.data.batch_size)
+
+    #     for mini in _iter_chunks(bucket_prompts, micro_bs):
+    #         mini = list(mini)
+    #         shard_prompts = self._shard_list(mini)  # NEW
+
+    #         images = self._gen_images_batch(shard_prompts, seed)
+    #         scores = call_reward(self.reward_fn, images, shard_prompts)
+    #         sum_scores_local = mean_score(scores, mode="sum")
+
+    #         # Глобальные суммы по всем рангам
+    #         sum_scores = self._allreduce_score_sum(sum_scores_local)  # NEW
+    #         count = self._allreduce_count(len(shard_prompts))         # NEW
+
+    #         if total_scores is None:
+    #             total_scores = sum_scores
+    #         else:
+    #             for name, s in sum_scores.items():
+    #                 total_scores[name] += s
+    #         total_count += count
+
+    #     return {name: float(score) / float(total_count) for name, score in total_scores.items()}
+
     def _eval_candidate_on_bucket(self, x: np.ndarray, bucket_prompts: List[str], seed: int) -> Dict[str, float]:
         self._apply_x_via_pipeline(x)
         total_scores = None
         total_count = 0
         micro_bs = int(self.cfg.data.batch_size)
-
         for mini in _iter_chunks(bucket_prompts, micro_bs):
-            mini = list(mini)
-            shard_prompts = self._shard_list(mini)  # NEW
-
-            images = self._gen_images_batch(shard_prompts, seed)
-            scores = call_reward(self.reward_fn, images, shard_prompts)
-            sum_scores_local = mean_score(scores, mode="sum")
-
-            # Глобальные суммы по всем рангам
-            sum_scores = self._allreduce_score_sum(sum_scores_local)  # NEW
-            count = self._allreduce_count(len(shard_prompts))         # NEW
-
+            mini = list(mini)  # ВАЖНО: не шардируем по рангам
+            images = self._gen_images_batch(mini, seed)
+            scores = call_reward(self.reward_fn, images, mini)
+            sum_scores = mean_score(scores, mode="sum")
             if total_scores is None:
                 total_scores = sum_scores
             else:
                 for name, s in sum_scores.items():
                     total_scores[name] += s
-            total_count += count
-
+            total_count += len(mini)
         return {name: float(score) / float(total_count) for name, score in total_scores.items()}
 
     def _eval_validation(self, x: np.ndarray, seed: int = 1234,
@@ -420,73 +437,40 @@ class CMAESTrainer:
             batch_prompts = self._next_batch()
 
             # evaluate candidates on the same batch
-            candidates = self.es.ask() if self._rank() == 0 else None
+            if self._rank() == 0:
+                candidates = self.es.ask()
+                log_scalars(self.writer, {f"train/num_candidates": len(candidates)}, step)
+            else:
+                candidates = None
             candidates = self._broadcast_object(candidates, src=0)  # одинаковый список у всех
 
             # shards by candidates
             idxs = list(range(len(candidates)))
             my_idxs = idxs[self._rank()::self._world()]
-            my_candidates = [candidates[i] for i in my_idxs]
+            my_cands = [candidates[i] for i in my_idxs]
 
-            # fitnesses = []
-            # scores = []
-            # for x in candidates:
-            #     score = self._eval_candidate_on_bucket(x, batch_prompts, seed=base_seed + generation)
-            #     fitnesses.append(-float(score["avg"]))  # CMA-ES minimizes
-            #     scores.append(score)
-            
-            fitnesses_local = []
-            scores_local = []
-            for i, x in zip(my_idxs, my_candidates):
-                score = self._eval_candidate_on_bucket(x, batch_prompts, seed=base_seed + generation)
-                fitness = -float(score["avg"])  # CMA-ES минимизирует
-                fitnesses_local.append((i, fitness))
-                scores_local.append((i, score))
-            
-            gathered_fit = None
-            gathered_scr = None
+            my_fit, my_scr = [], []
+            for i, x in tqdm(zip(my_idxs, my_cands), desc="Iter over candidates", total=len(my_cands)):
+                sc = self._eval_candidate_on_bucket(x, batch_prompts, seed=base_seed + generation)
+                my_fit.append((i, -float(sc["avg"])))
+                my_scr.append((i, sc))
+
+            # сбор результатов на rank 0 и tell()
             if self._is_dist():
-                gathered_fit = [None] * self._world() if self._rank() == 0 else None
-                gathered_scr = [None] * self._world() if self._rank() == 0 else None
-                dist.gather_object(fitnesses_local, gathered_fit, dst=0)
-                dist.gather_object(scores_local,   gathered_scr, dst=0)
+                recv_fit = [None] * self._world() if self._rank() == 0 else None
+                recv_scr = [None] * self._world() if self._rank() == 0 else None
+                dist.gather_object(my_fit, recv_fit, dst=0)
+                dist.gather_object(my_scr, recv_scr, dst=0)
             else:
-                gathered_fit = [fitnesses_local]
-                gathered_scr = [scores_local]
-
-
-
-
-            # self.es.tell(candidates, fitnesses)
-
-            # # generation metrics
-            # best_idx = int(np.argmin(fitnesses))
-            # best_x = np.asarray(candidates[best_idx], dtype=np.float64)
-            # best_fit = -float(fitnesses[best_idx])
-            # best_scores = scores[best_idx]
-            # mean_fit = -float(np.mean(fitnesses))
-
-            # # track best
-            # if best_fit > self.best_train:
-            #     self.best_train = best_fit
-            #     self.best_train_scores = best_scores
-            #     self.best_solution = best_x.copy()
-
-            # self.hist_train_best.append(best_fit)
-            # self.hist_train_mean.append(mean_fit)
-            # self.hist_train_best_scores.append(best_scores)
-
-            # # logging
-            # self._log_step(step, best_fit, mean_fit, float(self.es.sigma), best_x)
+                recv_fit, recv_scr = [my_fit], [my_scr]
 
             if self._rank() == 0:
-                pairs_fit = [p for part in gathered_fit for p in part]
-                pairs_scr = [p for part in gathered_scr for p in part]
+                pairs_fit = [p for part in recv_fit for p in part]
+                pairs_scr = [p for part in recv_scr for p in part]
                 pairs_fit.sort(key=lambda t: t[0])
                 pairs_scr.sort(key=lambda t: t[0])
                 fitnesses = [f for _, f in pairs_fit]
                 scores = [s for _, s in pairs_scr]
-
                 self.es.tell(candidates, fitnesses)
 
                 best_idx = int(np.argmin(fitnesses))
@@ -508,43 +492,8 @@ class CMAESTrainer:
 
             self._barrier()
 
-            # # validation schedule
-            # do_val = int(self.cfg.optimize.val_every_steps) > 0 and (step % int(self.cfg.optimize.val_every_steps) == 0 or step == max_gens)
-            # if do_val:
-            #     val_score = self._eval_validation(best_x, 
-            #                                       save_dir=os.path.join(self.logdir, "eval", f"step_{step}"), 
-            #                                       save_images=getattr(self.cfg.data, "save_eval_imgs", None),
-            #                                       seed=1234)
-                
-            #     self.hist_val.append(val_score)
-            #     for name, score in val_score.items():
-            #         log_scalars(self.writer, {f"val/{name}": float(score)}, step)
-
-            #     self._maybe_log_images(step, best_x)
-
-            #     ### overfitting checker
-            #     # train_val_gap = best_fit - float(val_score)
-            #     if val_score["avg"] > self.best_val:
-            #         self.best_val = float(val_score["avg"])
-            #     #     self.patience = 0
-            #     # else:
-            #     #     self.patience += 1
-
-            #     # if self.patience >= int(self.cfg.optimize.early_stopping_patience):
-            #     #     self._checkpoint_json(step, best_fit, mean_fit, val_score, best_x)
-            #     #     break
-
-            #     # if train_val_gap > float(self.cfg.optimize.overfitting_threshold) and self.patience >= int(self.cfg.optimize.early_stopping_patience):
-            #     #     self._checkpoint_json(step, best_fit, mean_fit, val_score, best_x)
-            #     #     break
-            #     self._checkpoint_json(step, best_fit, mean_fit, self.hist_val[-1]["avg"], best_x)
-            # else:
-            #     self.hist_val.append(None)
-
             do_val = int(self.cfg.optimize.val_every_steps) > 0 and (step % int(self.cfg.optimize.val_every_steps) == 0 or step == max_gens)
             if do_val:
-                # расшаренная валидация (каждый считает свою долю, редукция внутри _eval_validation)
-                # best_solution нужно разослать всем для согласованной оценки
                 best_sol = self._broadcast_object(self.best_solution if self._rank() == 0 else None, src=0)
                 best_sol = np.asarray(best_sol, dtype=np.float64)
                 val_score = self._eval_validation(
@@ -566,13 +515,6 @@ class CMAESTrainer:
                     self.hist_val.append(None)
 
             generation += 1
-
-        # final checkpoint
-        # last_mean = float(self.hist_train_mean[-1]) if self.hist_train_mean else float("-inf")
-        # last_val = self.best_val if (self.hist_val and self.hist_val[-1] is not None) else None
-        # self._checkpoint_json(generation, self.best_train, last_mean, last_val, self.best_solution)
-
-        # return self.best_solution, float(self.best_train), float(self.best_val if self.best_val != -np.inf else np.nan)
 
         if self._rank() == 0:
             last_mean = float(self.hist_train_mean[-1]) if self.hist_train_mean else float("-inf")

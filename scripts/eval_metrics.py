@@ -49,7 +49,7 @@ def read_val_prompts(path: str):
 
 def main(_):
 
-    log_dir = "/home/jovyan/sobolev/ii/danil/scaleguidance/evolve/logs/cmaes_imgr_2025-10-03_03:05:29"
+    log_dir = "/home/jovyan/sobolev/ii/danil/scaleguidance/evolve/logs/cmaes_hpsv3_1024_2025-10-10_04:27:45"
     out_dir = os.path.join(log_dir, "eval")
     out_path = Path(out_dir)
     if not out_path.exists():
@@ -96,15 +96,6 @@ def main(_):
         row.update(metrics_step)
         rows.append(row)
 
-        csv_path = out_path / "val.csv"
-        fieldnames = ["step"] + list(metrics_step.keys())
-        with open(csv_path, "w", newline="", encoding="utf-8") as f:
-            w = csv.DictWriter(f, fieldnames=fieldnames)
-            w.writeheader()
-            for r in rows:
-                w.writerow(r)
-        print(f"Saved: {csv_path}")
-
         steps = [r["step"] for r in rows]
         for metric_key in metrics_step.keys():
             ys = [float(r[metric_key]) for r in rows]
@@ -119,6 +110,15 @@ def main(_):
             plt.savefig(png_path.as_posix(), dpi=150)
             plt.close()
             print(f"Saved: {png_path}")
+
+            csv_path = out_path / f"val_{metric_key}.csv"
+            fieldnames = ["step", metric_key]
+            with open(csv_path, "w", newline="", encoding="utf-8") as f:
+                w = csv.DictWriter(f, fieldnames=fieldnames)
+                w.writeheader()
+                for r in rows:
+                    w.writerow({"step": r["step"], metric_key: r[metric_key]})
+            print(f"Saved: {csv_path}")
 
 if __name__ == "__main__":
     app.run(main)

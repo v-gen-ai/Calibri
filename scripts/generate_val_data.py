@@ -29,7 +29,7 @@ CONFIG = config_flags.DEFINE_config_file("config", default="configs/scaleguidanc
 
 def main(_):
 
-    log_dir = "/home/jovyan/sobolev/ii/danil/scaleguidance/evolve/logs/cmaes_imgr_2025-10-03_03:05:29"
+    log_dir = "/home/jovyan/sobolev/ii/danil/scaleguidance/evolve/logs/cmaes_hpsv3_1024_2025-10-10_04:27:45"
 
     cfg = CONFIG.value
     if cfg.experiment.seed is not None:
@@ -89,7 +89,7 @@ def main(_):
             ckpts.append((step, path, sol))
 
     ckpts.sort(key=lambda x: x[0])
-    ckpts = ckpts[:10] + ckpts[10::3]
+    ckpts = ckpts[6:]
     print(f"{len(ckpts)} steps for val:", [t[0] for t in ckpts])
 
     out_dir = os.path.join(log_dir, "eval")
@@ -99,7 +99,6 @@ def main(_):
         vals = trainer._eval_validation(sol, seed=cfg.experiment.seed,
                                         save_dir=save_dir,
                                         save_images=True)
-
 
 if __name__ == "__main__":
     app.run(main)

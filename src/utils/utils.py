@@ -70,10 +70,9 @@ def mean_score(scores, mode="mean") -> float:
                 res_scores[name] = float(np.sum([float(s) for s in score_seq]))
     return res_scores
 
-def call_reward(fn, images, prompts):
-    # Унифицируем контракт: всегда возвращаем только список/массив числовых scores
+def call_reward(fn, images, prompts, metadata=None):
     try:
-        out = fn(images, prompts, None)
+        out = fn(images, prompts, metadata)
     except TypeError:
         out = fn(images, prompts)
     return out[0]

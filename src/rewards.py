@@ -10,10 +10,7 @@ from src.utils.utils import to_pil_list
 
 def jpeg_incompressibility():
     def _fn(images, prompts, metadata):
-        if isinstance(images, torch.Tensor):
-            images = (images * 255).round().clamp(0, 255).to(torch.uint8).cpu().numpy()
-            images = images.transpose(0, 2, 3, 1)  # NCHW -> NHWC
-        images = [Image.fromarray(image) for image in images]
+        images = to_pil_list(images)
         buffers = [io.BytesIO() for _ in images]
         for image, buffer in zip(images, buffers):
             image.save(buffer, format="JPEG", quality=95)
@@ -33,7 +30,7 @@ def jpeg_compressibility():
     return _fn
 
 def aesthetic_score():
-    from flow_grpo.aesthetic_scorer import AestheticScorer
+    from src.metrics.aesthetic_scorer import AestheticScorer
 
     scorer = AestheticScorer(dtype=torch.float32).cuda()
 
@@ -49,7 +46,7 @@ def aesthetic_score():
     return _fn
 
 def clip_score():
-    from flow_grpo.clip_scorer import ClipScorer
+    from src.metrics.clip_scorer import ClipScorer
 
     scorer = ClipScorer(dtype=torch.float32).cuda()
 
@@ -63,7 +60,7 @@ def clip_score():
     return _fn
 
 def image_similarity_score(device):
-    from flow_grpo.clip_scorer import ClipScorer
+    from src.metrics.clip_scorer import ClipScorer
 
     scorer = ClipScorer(device=device).cuda()
 
@@ -411,6 +408,20 @@ def unifiedreward_score_sglang(device):
     return _fn
 
 
+def unified_reward_qwen(device):
+
+    from src.metrics.unified_reward_qwen_scorer import UnifiedRewardQwen
+
+    scorer = UnifiedRewardQwen(device=device)
+
+    def _fn(images, prompts, metadata=None):
+        images = to_pil_list(images)
+        scores = scorer.score(prompts, images)
+        return scores, {}
+    
+    return _fn
+
+
 def qalign_score(device):
     """
     In-proc Q-Align scorer.
@@ -636,6 +647,7 @@ def multi_score(device, score_dict):
         "aesthetic": aesthetic_score,
         "jpeg_compressibility": jpeg_compressibility,
         "unifiedreward": unifiedreward_score_sglang,
+        "unifiedreward_qwen": unified_reward_qwen,
         "geneval": geneval_score,
         "clipscore": clip_score,
         "image_similarity": image_similarity_score,

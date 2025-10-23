@@ -3,7 +3,7 @@ from ml_collections import ConfigDict
 
 def get_config():
     cfg = ConfigDict()
-    cfg.device = "cuda:0"
+    cfg.device = "cuda"
 
     cfg.experiment = ConfigDict()
     cfg.experiment.name = "flux_autoguidance_cmaes"

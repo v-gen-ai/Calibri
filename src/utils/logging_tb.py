@@ -7,6 +7,15 @@ from torch.utils.tensorboard import SummaryWriter
 import numpy as np
 
 
+class NullWriter:
+    def add_scalar(self, *args, **kwargs): 
+        pass
+    def add_image(self, *args, **kwargs): 
+        pass
+    def close(self): 
+        pass
+
+
 def create_writer(log_dir):
     return SummaryWriter(log_dir=log_dir)
 

@@ -11,11 +11,12 @@ if project_root not in sys.path:
 from absl import app, flags
 from ml_collections import config_flags
 import torch
+from accelerate import Accelerator
 
 import src.rewards
 from src.models.flux_sg import SGFluxPipeline
 from src.utils.utils import set_seed, save_config
-from src.utils.logging_tb import create_writer
+from src.utils.logging_tb import create_writer, NullWriter
 from src.data.prompts import make_loader
 from src.optim.cmaes import CMAESTrainer
 
@@ -26,6 +27,7 @@ def main(_):
 
     cfg = _CONFIG.value
 
+    accelerator = Accelerator()  # NEW
     if cfg.experiment.seed is not None:
         set_seed(cfg.experiment.seed)
 
@@ -35,13 +37,14 @@ def main(_):
     elif cfg.model.dtype == "bf16":
         inference_dtype = torch.bfloat16
 
+    device = accelerator.device
     pipeline = SGFluxPipeline(
-        device=cfg.device,
+        device=device,
         dtype=inference_dtype,
         model_name=cfg.model.model_name,
         num_models=cfg.scaleguidance.num_models
     )
-    pipeline.pipeline.set_progress_bar_config(disable=True)
+    # pipeline.pipeline.set_progress_bar_config(disable=True)
 
     reward_fn = getattr(src.rewards, 'multi_score')(cfg.device, cfg.reward_fn)
     eval_reward_fn = getattr(src.rewards, 'multi_score')(cfg.device, cfg.reward_fn_eval)
@@ -69,13 +72,16 @@ def main(_):
         False, 
         False, 
         limit=cfg.data.limit_val, 
-        # cut_cnt=2
+        cut_cnt=3
     )
 
-    trainer = CMAESTrainer(cfg, pipeline, reward_fn, eval_reward_fn, writer, train_loader, val_loader, logdir=final_logdir)
+    trainer = CMAESTrainer(
+        cfg, pipeline, reward_fn, eval_reward_fn, writer,
+        train_loader, val_loader, logdir=final_logdir, accelerator=accelerator
+    )
     best_solution, best_train, best_val = trainer.train()
-
-    writer.close()
+    if accelerator.is_main_process:
+        writer.close()
 
 if __name__ == "__main__":
     app.run(main)

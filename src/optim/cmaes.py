@@ -2,6 +2,7 @@ import os
 import json
 import time
 from typing import List, Tuple, Dict, Optional
+import pickle
 
 import numpy as np
 from tqdm import tqdm
@@ -160,18 +161,68 @@ class CMAESTrainer:
 
             opts["bounds"] = [bounds_low, bounds_high]
 
-        self.es = cma.CMAEvolutionStrategy(
-            x0=x0,
-            sigma0=float(cfg.optimize.initial_sigma),
-            inopts=opts,
-        )
+        # self.es = cma.CMAEvolutionStrategy(
+        #     x0=x0,
+        #     sigma0=float(cfg.optimize.initial_sigma),
+        #     inopts=opts,
+        # )
 
-        # state
-        self._train_iter = iter(self.train_loader) if self.train_loader is not None else None
-        self.best_solution = x0.copy()
-        self.best_train = -np.inf
-        self.best_val = -np.inf
-        self.patience = 0
+        # # state
+        # self._train_iter = iter(self.train_loader) if self.train_loader is not None else None
+        # self.best_solution = x0.copy()
+        # self.best_train = -np.inf
+        # self.best_val = -np.inf
+        # self.patience = 0
+
+        self.generation = 0
+        resume_state = getattr(cfg.experiment, "resume_state", None)
+        resume_json  = getattr(cfg.experiment, "resume_json",  None)
+
+        if resume_state and os.path.isfile(resume_state):
+            with open(resume_state, "rb") as f:
+                st = pickle.load(f)
+            self.es = st["es"]
+            self.generation = int(st.get("generation", 0))
+            self.best_solution = np.asarray(st.get("best_solution", x0), dtype=np.float64)
+            self.best_train = float(st.get("best_train", -np.inf))
+            self.best_val = float(st.get("best_val", -np.inf))
+            self.hist_train_best = list(st.get("hist_train_best", []))
+            self.hist_train_mean = list(st.get("hist_train_mean", []))
+            self.hist_train_best_scores = list(st.get("hist_train_best_scores", []))
+            self.hist_val = list(st.get("hist_val", []))
+            self.hist_sigma = list(st.get("hist_sigma", []))
+            self.hist_models_scales = list(st.get("hist_models_scales", []))
+            # RNG
+            if st.get("np_rng_state", None) is not None:
+                np.random.set_state(st["np_rng_state"])
+            if st.get("torch_rng_state", None) is not None:
+                torch.set_rng_state(st["torch_rng_state"])
+            if torch.cuda.is_available() and st.get("torch_cuda_rng_state_all", None) is not None:
+                torch.cuda.set_rng_state_all(st["torch_cuda_rng_state_all"])
+        else:
+            # optional JSON resume: use saved solution as new x0 (+ optional sigma)
+            if resume_json and os.path.isfile(resume_json):
+                with open(resume_json, "r", encoding="utf-8") as f:
+                    payload = json.load(f)
+                x0 = np.asarray(payload["solution"], dtype=np.float64)
+                self.generation = int(payload.get("step", 0))
+                self.best_solution = x0.copy()
+                self.best_train = float(payload.get("train_best", -np.inf))
+                v = payload.get("val", None)
+                self.best_val = float(v) if v is not None else float("-inf")
+                if "sigma" in payload:
+                    opts["sigma0"] = float(payload["sigma"])
+            else:
+                self._train_iter = iter(self.train_loader) if self.train_loader is not None else None
+                self.best_solution = x0.copy()
+                self.best_train = -np.inf
+                self.best_val = -np.inf
+
+            self.es = cma.CMAEvolutionStrategy(
+                x0=x0,
+                sigma0=float(cfg.optimize.initial_sigma),
+                inopts=opts,
+            )
 
         # history
         self.hist_train_best: List[float] = []
@@ -397,7 +448,10 @@ class CMAESTrainer:
     def _checkpoint_json(self, step: int, best_fit: float, mean_fit: float, val_fit: Optional[float], best_x: np.ndarray):
         if getattr(self.cfg.experiment, "save_json", None) is None:
             return
-        run_dir = getattr(self.writer, "log_dir", None) or os.path.join(self.cfg.experiment.log_dir, self.cfg.experiment.name)
+        if self._rank() != 0:
+            return
+        # run_dir = getattr(self.writer, "log_dir", None)
+        run_dir = self.logdir
         run_dir = os.path.join(run_dir, "checkpoints")
         os.makedirs(run_dir, exist_ok=True)
         payload = {
@@ -407,10 +461,39 @@ class CMAESTrainer:
             "val": None if val_fit is None else float(val_fit),
             "solution": [float(v) for v in list(best_x)],
             "shapes": self.shapes,
+            "sigma": float(self.es.sigma),
             "timestamp": int(time.time()),
         }
         with open(os.path.join(run_dir, f"cmaes_step_{step:04d}.json"), "w", encoding="utf-8") as f:
             json.dump(payload, f, ensure_ascii=False, indent=2)
+
+    def _state_path(self, step: int) -> str:
+        run_dir = os.path.join(self.logdir, "checkpoints", f"step_{step}")
+        os.makedirs(run_dir, exist_ok=True)
+        return os.path.join(run_dir, f"cmaes_state_{step:04d}.pkl")
+
+    def _save_state(self, step: int):
+        if self._rank() != 0:
+            return
+        st = {
+            "generation": int(step),
+            "es": self.es,
+            "best_solution": self.best_solution,
+            "best_train": float(self.best_train),
+            "best_val": float(self.best_val),
+            "hist_train_best": self.hist_train_best,
+            "hist_train_mean": self.hist_train_mean,
+            "hist_train_best_scores": self.hist_train_best_scores,
+            "hist_val": self.hist_val,
+            "hist_sigma": self.hist_sigma,
+            "hist_models_scales": self.hist_models_scales,
+            "np_rng_state": np.random.get_state(),
+            "torch_rng_state": torch.get_rng_state(),
+            "torch_cuda_rng_state_all": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
+        }
+        with open(self._state_path(step), "wb") as f:
+            pickle.dump(st, f)
+
 
     def train(self) -> Tuple[np.ndarray, float, float]:
         generation = 0
@@ -429,6 +512,7 @@ class CMAESTrainer:
                     log_scalars(self.writer, {f"val/{name}": float(score)}, generation)
                 self._maybe_log_images(generation, orig_x)
                 self._checkpoint_json(generation, -1.0, -1.0, val_score["avg"], orig_x)
+                self._save_state(generation)
 
         while not self.es.stop() and (generation < max_gens or max_gens < 0):
             step = generation + 1
@@ -510,6 +594,7 @@ class CMAESTrainer:
                     if val_score["avg"] > self.best_val:
                         self.best_val = float(val_score["avg"])
                     self._checkpoint_json(step, self.best_train, float(self.hist_train_mean[-1]), self.hist_val[-1]["avg"], best_sol)
+                    self._save_state(step)
             else:
                 if self._rank() == 0:
                     self.hist_val.append(None)
@@ -520,8 +605,8 @@ class CMAESTrainer:
             last_mean = float(self.hist_train_mean[-1]) if self.hist_train_mean else float("-inf")
             last_val = self.best_val if (self.hist_val and self.hist_val[-1] is not None) else None
             self._checkpoint_json(generation, self.best_train, last_mean, last_val, self.best_solution)
+            self._save_state(generation)
 
-        # разошлём финальный результат всем, чтобы возврат был одинаков
         result = self._broadcast_object(
             dict(x=self.best_solution.tolist() if self._rank() == 0 else None,
                  best_train=float(self.best_train if self._rank() == 0 else 0.0),

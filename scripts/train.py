@@ -12,6 +12,7 @@ from absl import app, flags
 from ml_collections import config_flags
 import torch
 from accelerate import Accelerator
+import torch.distributed as dist
 
 import src.rewards
 from src.models.flux_sg import SGFluxPipeline
@@ -27,7 +28,7 @@ def main(_):
 
     cfg = _CONFIG.value
 
-    accelerator = Accelerator()  # NEW
+    accelerator = Accelerator()
     if cfg.experiment.seed is not None:
         set_seed(cfg.experiment.seed)
 
@@ -49,12 +50,23 @@ def main(_):
     reward_fn = getattr(src.rewards, 'multi_score')(cfg.device, cfg.reward_fn)
     eval_reward_fn = getattr(src.rewards, 'multi_score')(cfg.device, cfg.reward_fn_eval)
 
-    os.makedirs(cfg.experiment.log_dir, exist_ok=True)
-    current_time = datetime.now().strftime("%Y-%m-%d_%H:%M:%S")
-    final_logdir = os.path.join(cfg.experiment.log_dir, f"{cfg.experiment.name}_{current_time}")
-    os.makedirs(final_logdir, exist_ok=True)
-    save_config(cfg, final_logdir)
-    writer = create_writer(final_logdir)
+    if accelerator.is_main_process:
+        os.makedirs(cfg.experiment.log_dir, exist_ok=True)
+        current_time = datetime.now().strftime("%Y-%m-%d_%H:%M:%S")
+        final_logdir = os.path.join(cfg.experiment.log_dir, f"{cfg.experiment.name}_{current_time}")
+        os.makedirs(final_logdir, exist_ok=True)
+        save_config(cfg, final_logdir)
+    else:
+        final_logdir = None
+
+    # broadcast same final_logdir to all ranks
+    if dist.is_available() and dist.is_initialized():
+        container = [final_logdir]
+        dist.broadcast_object_list(container, src=0)
+        final_logdir = container[0]
+
+    # writer: only on main, others use NullWriter (no files)
+    writer = create_writer(final_logdir) if accelerator.is_main_process else NullWriter()
 
     train_loader = make_loader(
         cfg.data.train_dataset, 
@@ -72,7 +84,7 @@ def main(_):
         False, 
         False, 
         limit=cfg.data.limit_val, 
-        cut_cnt=1
+        # cut_cnt=1
     )
 
     trainer = CMAESTrainer(

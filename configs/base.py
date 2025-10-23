@@ -9,8 +9,8 @@ def get_config():
     cfg.experiment.name = "flux_autoguidance_cmaes"
     cfg.experiment.seed = 42
     cfg.experiment.log_dir = "logs"
-    cfg.experiment.save_images = False  # можно включить примеры
-    cfg.experiment.test_dataset = "data/test_log.txt"  # dataset to save images on
+    cfg.experiment.save_images = False
+    cfg.experiment.test_dataset = "data/test_log.txt"
     cfg.experiment.save_json = True
     cfg.experiment.eval_orig_model = True
 
@@ -28,7 +28,7 @@ def get_config():
     cfg.optimize = ConfigDict()
     cfg.optimize.initial_sigma = 0.25
     cfg.optimize.max_generations = 50
-    cfg.optimize.population_size = None  # пусть CMA-ES подберёт
+    cfg.optimize.population_size = None
     cfg.optimize.val_every_steps = 3
     cfg.optimize.early_stopping_patience = 10
     cfg.optimize.overfitting_threshold = 0.15

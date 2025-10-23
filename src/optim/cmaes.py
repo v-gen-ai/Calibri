@@ -8,6 +8,7 @@ from tqdm import tqdm
 import torch
 import cma
 from PIL import Image
+import torch.distributed as dist
 
 from src.utils.logging_tb import log_scalars, log_images, log_scatter
 from src.utils.utils import to_pil_list, call_reward, mean_score
@@ -109,15 +110,17 @@ def _unflatten_to_gs(x: np.ndarray, shapes: Dict[str, int]):
 
 
 class CMAESTrainer:
-    def __init__(self, cfg, pipeline, reward_fn, eval_reward_fn, writer, train_loader, val_loader, logdir=None):
+    def __init__(self, cfg, pipeline, reward_fn, eval_reward_fn, writer, 
+                 train_loader, val_loader, logdir=None, accelerator=None):
         self.cfg = cfg
-        self.pipeline = pipeline  # GSFluxPipeline
+        self.pipeline = pipeline  # SGFluxPipeline
         self.reward_fn = reward_fn
         self.eval_reward_fn = eval_reward_fn
         self.writer = writer
         self.train_loader = train_loader
         self.val_loader = val_loader
         self.logdir = logdir
+        self.accelerator = accelerator
 
         self.device = _get_device(cfg)
         self.gen_params = _gen_params(cfg)
@@ -179,12 +182,58 @@ class CMAESTrainer:
         self.hist_sigma: List[float] = []
         self.hist_models_scales: List[List[float]] = []
 
+    def _is_dist(self):
+        return dist.is_available() and dist.is_initialized()
+
+    def _rank(self):
+        return dist.get_rank() if self._is_dist() else 0
+
+    def _world(self):
+        return dist.get_world_size() if self._is_dist() else 1
+
+    def _barrier(self):
+        if self._is_dist():
+            dist.barrier()
+
+    def _broadcast_object(self, obj, src=0):
+        if not self._is_dist():
+            return obj
+        container = [obj]
+        dist.broadcast_object_list(container, src=src)
+        return container[0]
+
+    def _shard_list(self, xs):
+        if self._world() <= 1:
+            return list(xs)
+        r, w = self._rank(), self._world()
+        return list(xs)[r::w]
+
+    def _allreduce_count(self, n_local: int) -> int:
+        if not self._is_dist():
+            return n_local
+        t = torch.tensor([int(n_local)], device=self.device)
+        dist.all_reduce(t, op=dist.ReduceOp.SUM)
+        return int(t.item())
+
+    def _allreduce_score_sum(self, d_local: dict) -> dict:
+        # Стабильный порядок ключей
+        keys = sorted(d_local.keys())
+        vals = torch.tensor([float(d_local[k]) for k in keys], device=self.device)
+        if self._is_dist():
+            dist.all_reduce(vals, op=dist.ReduceOp.SUM)
+        return {k: float(v) for k, v in zip(keys, vals.tolist())}
+
     def _next_batch(self) -> List[str]:
-        try:
-            batch = next(self._train_iter)
-        except StopIteration:
-            self._train_iter = iter(self.train_loader)
-            batch = next(self._train_iter)
+        batch = None
+        if self._rank() == 0:
+            try:
+                batch = next(self._train_iter)
+            except StopIteration:
+                self._train_iter = iter(self.train_loader)
+                batch = next(self._train_iter)
+            batch = list(batch)
+        # один и тот же batch на всех рангах
+        batch = self._broadcast_object(batch, src=0)
         return list(batch)
 
     def _apply_x_via_pipeline(self, x: np.ndarray):
@@ -211,42 +260,49 @@ class CMAESTrainer:
         return out.images
 
     def _eval_candidate_on_bucket(self, x: np.ndarray, bucket_prompts: List[str], seed: int) -> Dict[str, float]:
-        # применяем параметры кандидата
         self._apply_x_via_pipeline(x)
         total_scores = None
-        count = 0
+        total_count = 0
         micro_bs = int(self.cfg.data.batch_size)
+
         for mini in _iter_chunks(bucket_prompts, micro_bs):
-            images = self._gen_images_batch(list(mini), seed)
-            scores = call_reward(self.reward_fn, images, list(mini))
-            sum_scores = mean_score(scores, mode="sum")
+            mini = list(mini)
+            shard_prompts = self._shard_list(mini)  # NEW
+
+            images = self._gen_images_batch(shard_prompts, seed)
+            scores = call_reward(self.reward_fn, images, shard_prompts)
+            sum_scores_local = mean_score(scores, mode="sum")
+
+            # Глобальные суммы по всем рангам
+            sum_scores = self._allreduce_score_sum(sum_scores_local)  # NEW
+            count = self._allreduce_count(len(shard_prompts))         # NEW
+
             if total_scores is None:
                 total_scores = sum_scores
             else:
                 for name, s in sum_scores.items():
                     total_scores[name] += s
-            count += len(mini)
-        # усредняем метрики по всему bucket
-        return {name: float(score) / float(count) for name, score in total_scores.items()}
+            total_count += count
 
-    def _eval_validation(self,
-                         x: np.ndarray,
-                         seed: int = 1234,
-                         save_dir: str | None = None,
-                         save_images: bool = False,
-                         save_format: str = "png",
-                         save_limit: int | None = None,) -> dict | None:
+        return {name: float(score) / float(total_count) for name, score in total_scores.items()}
+
+    def _eval_validation(self, x: np.ndarray, seed: int = 1234,
+                         save_dir: str | None = None, save_images: bool = False,
+                         save_format: str = "png", save_limit: int | None = None) -> dict | None:
         self._apply_x_via_pipeline(x)
-        # total = 0.0
         total_scores = None
-        count = 0
+        total_count = 0
         global_idx = 0
         gen_device = "cpu"
+
         for prompts in tqdm(self.val_loader, desc="Validating", total=len(self.val_loader)):
+            prompts = list(prompts)
+            shard_prompts = self._shard_list(prompts)
+
             generator = torch.Generator(device=gen_device).manual_seed(int(seed))
             with torch.inference_mode():
                 out = self.pipeline(
-                    list(prompts),
+                    list(shard_prompts),
                     num_inference_steps=self.gen_params["num_inference_steps"],
                     guidance_scale=self.gen_params["guidance_scale"],
                     height=self.gen_params["height"],
@@ -255,10 +311,10 @@ class CMAESTrainer:
                 )
             images = out.images
 
-            if save_images and save_dir is not None:
+            if save_images and save_dir is not None and self._rank() == 0:
                 os.makedirs(save_dir, exist_ok=True)
                 pil_images = to_pil_list(images)
-                for im, prompt in zip(pil_images, list(prompts)):
+                for im in pil_images:
                     if save_limit is not None and global_idx >= save_limit:
                         break
                     fname = f"{global_idx:06d}.{save_format}"
@@ -266,18 +322,23 @@ class CMAESTrainer:
                     global_idx += 1
 
             if self.eval_reward_fn:
-                scores = call_reward(self.eval_reward_fn, images, list(prompts))
-                sum_scores = mean_score(scores, mode="sum")
+                scores = call_reward(self.eval_reward_fn, images, list(shard_prompts))
+                sum_scores_local = mean_score(scores, mode="sum")
+                sum_scores = self._allreduce_score_sum(sum_scores_local)
+                count = self._allreduce_count(len(shard_prompts))
+
                 if total_scores is None:
                     total_scores = sum_scores
                 else:
                     for name, score in sum_scores.items():
                         total_scores[name] += score
-            count += len(prompts)
+                total_count += count
+
         if self.eval_reward_fn:
-            return {name: score / count for name, score in total_scores.items()}
+            return {name: score / total_count for name, score in total_scores.items()}
         else:
             return None
+
 
     def _log_step(self, step: int, best_fit: float, mean_fit: float, sigma: float, best_x: np.ndarray):
         scalars = {
@@ -346,10 +407,11 @@ class CMAESTrainer:
                                               save_dir=os.path.join(self.logdir, "eval", f"step_{generation}"), 
                                               save_images=getattr(self.cfg.data, "save_eval_imgs", None),
                                               seed=1234)
-            for name, score in val_score.items():
-                log_scalars(self.writer, {f"val/{name}": float(score)}, generation)
-            self._maybe_log_images(generation, orig_x)
-            self._checkpoint_json(generation, -1.0, -1.0, val_score["avg"], orig_x)
+            if self._rank() == 0:
+                for name, score in val_score.items():
+                    log_scalars(self.writer, {f"val/{name}": float(score)}, generation)
+                self._maybe_log_images(generation, orig_x)
+                self._checkpoint_json(generation, -1.0, -1.0, val_score["avg"], orig_x)
 
         while not self.es.stop() and (generation < max_gens or max_gens < 0):
             step = generation + 1
@@ -358,75 +420,171 @@ class CMAESTrainer:
             batch_prompts = self._next_batch()
 
             # evaluate candidates on the same batch
-            candidates = self.es.ask()
-            log_scalars(self.writer, {f"train/num_candidates": len(candidates)}, step)
-            fitnesses = []
-            scores = []
-            for x in candidates:
+            candidates = self.es.ask() if self._rank() == 0 else None
+            candidates = self._broadcast_object(candidates, src=0)  # одинаковый список у всех
+
+            # shards by candidates
+            idxs = list(range(len(candidates)))
+            my_idxs = idxs[self._rank()::self._world()]
+            my_candidates = [candidates[i] for i in my_idxs]
+
+            # fitnesses = []
+            # scores = []
+            # for x in candidates:
+            #     score = self._eval_candidate_on_bucket(x, batch_prompts, seed=base_seed + generation)
+            #     fitnesses.append(-float(score["avg"]))  # CMA-ES minimizes
+            #     scores.append(score)
+            
+            fitnesses_local = []
+            scores_local = []
+            for i, x in zip(my_idxs, my_candidates):
                 score = self._eval_candidate_on_bucket(x, batch_prompts, seed=base_seed + generation)
-                fitnesses.append(-float(score["avg"]))  # CMA-ES minimizes
-                scores.append(score)
+                fitness = -float(score["avg"])  # CMA-ES минимизирует
+                fitnesses_local.append((i, fitness))
+                scores_local.append((i, score))
+            
+            gathered_fit = None
+            gathered_scr = None
+            if self._is_dist():
+                gathered_fit = [None] * self._world() if self._rank() == 0 else None
+                gathered_scr = [None] * self._world() if self._rank() == 0 else None
+                dist.gather_object(fitnesses_local, gathered_fit, dst=0)
+                dist.gather_object(scores_local,   gathered_scr, dst=0)
+            else:
+                gathered_fit = [fitnesses_local]
+                gathered_scr = [scores_local]
 
-            self.es.tell(candidates, fitnesses)
 
-            # generation metrics
-            best_idx = int(np.argmin(fitnesses))
-            best_x = np.asarray(candidates[best_idx], dtype=np.float64)
-            best_fit = -float(fitnesses[best_idx])
-            best_scores = scores[best_idx]
-            mean_fit = -float(np.mean(fitnesses))
 
-            # track best
-            if best_fit > self.best_train:
-                self.best_train = best_fit
-                self.best_train_scores = best_scores
-                self.best_solution = best_x.copy()
 
-            self.hist_train_best.append(best_fit)
-            self.hist_train_mean.append(mean_fit)
-            self.hist_train_best_scores.append(best_scores)
+            # self.es.tell(candidates, fitnesses)
 
-            # logging
-            self._log_step(step, best_fit, mean_fit, float(self.es.sigma), best_x)
+            # # generation metrics
+            # best_idx = int(np.argmin(fitnesses))
+            # best_x = np.asarray(candidates[best_idx], dtype=np.float64)
+            # best_fit = -float(fitnesses[best_idx])
+            # best_scores = scores[best_idx]
+            # mean_fit = -float(np.mean(fitnesses))
 
-            # validation schedule
+            # # track best
+            # if best_fit > self.best_train:
+            #     self.best_train = best_fit
+            #     self.best_train_scores = best_scores
+            #     self.best_solution = best_x.copy()
+
+            # self.hist_train_best.append(best_fit)
+            # self.hist_train_mean.append(mean_fit)
+            # self.hist_train_best_scores.append(best_scores)
+
+            # # logging
+            # self._log_step(step, best_fit, mean_fit, float(self.es.sigma), best_x)
+
+            if self._rank() == 0:
+                pairs_fit = [p for part in gathered_fit for p in part]
+                pairs_scr = [p for part in gathered_scr for p in part]
+                pairs_fit.sort(key=lambda t: t[0])
+                pairs_scr.sort(key=lambda t: t[0])
+                fitnesses = [f for _, f in pairs_fit]
+                scores = [s for _, s in pairs_scr]
+
+                self.es.tell(candidates, fitnesses)
+
+                best_idx = int(np.argmin(fitnesses))
+                best_x = np.asarray(candidates[best_idx], dtype=np.float64)
+                best_fit = -float(fitnesses[best_idx])
+                best_scores = scores[best_idx]
+                mean_fit = -float(np.mean(fitnesses))
+
+                if best_fit > self.best_train:
+                    self.best_train = best_fit
+                    self.best_train_scores = best_scores
+                    self.best_solution = best_x.copy()
+
+                self.hist_train_best.append(best_fit)
+                self.hist_train_mean.append(mean_fit)
+                self.hist_train_best_scores.append(best_scores)
+
+                self._log_step(step, best_fit, mean_fit, float(self.es.sigma), best_x)
+
+            self._barrier()
+
+            # # validation schedule
+            # do_val = int(self.cfg.optimize.val_every_steps) > 0 and (step % int(self.cfg.optimize.val_every_steps) == 0 or step == max_gens)
+            # if do_val:
+            #     val_score = self._eval_validation(best_x, 
+            #                                       save_dir=os.path.join(self.logdir, "eval", f"step_{step}"), 
+            #                                       save_images=getattr(self.cfg.data, "save_eval_imgs", None),
+            #                                       seed=1234)
+                
+            #     self.hist_val.append(val_score)
+            #     for name, score in val_score.items():
+            #         log_scalars(self.writer, {f"val/{name}": float(score)}, step)
+
+            #     self._maybe_log_images(step, best_x)
+
+            #     ### overfitting checker
+            #     # train_val_gap = best_fit - float(val_score)
+            #     if val_score["avg"] > self.best_val:
+            #         self.best_val = float(val_score["avg"])
+            #     #     self.patience = 0
+            #     # else:
+            #     #     self.patience += 1
+
+            #     # if self.patience >= int(self.cfg.optimize.early_stopping_patience):
+            #     #     self._checkpoint_json(step, best_fit, mean_fit, val_score, best_x)
+            #     #     break
+
+            #     # if train_val_gap > float(self.cfg.optimize.overfitting_threshold) and self.patience >= int(self.cfg.optimize.early_stopping_patience):
+            #     #     self._checkpoint_json(step, best_fit, mean_fit, val_score, best_x)
+            #     #     break
+            #     self._checkpoint_json(step, best_fit, mean_fit, self.hist_val[-1]["avg"], best_x)
+            # else:
+            #     self.hist_val.append(None)
+
             do_val = int(self.cfg.optimize.val_every_steps) > 0 and (step % int(self.cfg.optimize.val_every_steps) == 0 or step == max_gens)
             if do_val:
-                val_score = self._eval_validation(best_x, 
-                                                  save_dir=os.path.join(self.logdir, "eval", f"step_{step}"), 
-                                                  save_images=getattr(self.cfg.data, "save_eval_imgs", None),
-                                                  seed=1234)
-                
-                self.hist_val.append(val_score)
-                for name, score in val_score.items():
-                    log_scalars(self.writer, {f"val/{name}": float(score)}, step)
-
-                self._maybe_log_images(step, best_x)
-
-                ### overfitting checker
-                # train_val_gap = best_fit - float(val_score)
-                if val_score["avg"] > self.best_val:
-                    self.best_val = float(val_score["avg"])
-                #     self.patience = 0
-                # else:
-                #     self.patience += 1
-
-                # if self.patience >= int(self.cfg.optimize.early_stopping_patience):
-                #     self._checkpoint_json(step, best_fit, mean_fit, val_score, best_x)
-                #     break
-
-                # if train_val_gap > float(self.cfg.optimize.overfitting_threshold) and self.patience >= int(self.cfg.optimize.early_stopping_patience):
-                #     self._checkpoint_json(step, best_fit, mean_fit, val_score, best_x)
-                #     break
-                self._checkpoint_json(step, best_fit, mean_fit, self.hist_val[-1]["avg"], best_x)
+                # расшаренная валидация (каждый считает свою долю, редукция внутри _eval_validation)
+                # best_solution нужно разослать всем для согласованной оценки
+                best_sol = self._broadcast_object(self.best_solution if self._rank() == 0 else None, src=0)
+                best_sol = np.asarray(best_sol, dtype=np.float64)
+                val_score = self._eval_validation(
+                    best_sol,
+                    save_dir=os.path.join(self.logdir, "eval", f"step_{step}"),
+                    save_images=getattr(self.cfg.data, "save_eval_imgs", None),
+                    seed=1234
+                )
+                if self._rank() == 0:
+                    self.hist_val.append(val_score)
+                    for name, score in val_score.items():
+                        log_scalars(self.writer, {f"val/{name}": float(score)}, step)
+                    self._maybe_log_images(step, best_sol)
+                    if val_score["avg"] > self.best_val:
+                        self.best_val = float(val_score["avg"])
+                    self._checkpoint_json(step, self.best_train, float(self.hist_train_mean[-1]), self.hist_val[-1]["avg"], best_sol)
             else:
-                self.hist_val.append(None)
+                if self._rank() == 0:
+                    self.hist_val.append(None)
 
             generation += 1
 
         # final checkpoint
-        last_mean = float(self.hist_train_mean[-1]) if self.hist_train_mean else float("-inf")
-        last_val = self.best_val if (self.hist_val and self.hist_val[-1] is not None) else None
-        self._checkpoint_json(generation, self.best_train, last_mean, last_val, self.best_solution)
+        # last_mean = float(self.hist_train_mean[-1]) if self.hist_train_mean else float("-inf")
+        # last_val = self.best_val if (self.hist_val and self.hist_val[-1] is not None) else None
+        # self._checkpoint_json(generation, self.best_train, last_mean, last_val, self.best_solution)
 
-        return self.best_solution, float(self.best_train), float(self.best_val if self.best_val != -np.inf else np.nan)
+        # return self.best_solution, float(self.best_train), float(self.best_val if self.best_val != -np.inf else np.nan)
+
+        if self._rank() == 0:
+            last_mean = float(self.hist_train_mean[-1]) if self.hist_train_mean else float("-inf")
+            last_val = self.best_val if (self.hist_val and self.hist_val[-1] is not None) else None
+            self._checkpoint_json(generation, self.best_train, last_mean, last_val, self.best_solution)
+
+        # разошлём финальный результат всем, чтобы возврат был одинаков
+        result = self._broadcast_object(
+            dict(x=self.best_solution.tolist() if self._rank() == 0 else None,
+                 best_train=float(self.best_train if self._rank() == 0 else 0.0),
+                 best_val=float(self.best_val if self._rank() == 0 else 0.0)), 
+            src=0
+        )
+        best_solution = np.asarray(result["x"], dtype=np.float64)
+        return best_solution, result["best_train"], result["best_val"]

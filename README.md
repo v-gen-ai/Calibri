@@ -10,7 +10,7 @@ pip install -r requirements.txt
 
 To run the experiment:
 ```
-python scripts/train.py --config configs/scaleguidance.py:cmaes_image_reward
+accelerate launch --num_processes <NUM_GPU> scripts/train.py --config configs/scaleguidance.py:cmaes_hpsv3_2models
 ```
 
 You can find different configs at configs/gatescale.py

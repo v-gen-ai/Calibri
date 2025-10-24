@@ -464,6 +464,8 @@ class CMAESTrainer:
             "sigma": float(self.es.sigma),
             "timestamp": int(time.time()),
         }
+        run_dir = os.path.join(run_dir, f"step_{step}")
+        os.makedirs(run_dir, exist_ok=True)
         with open(os.path.join(run_dir, f"cmaes_step_{step:04d}.json"), "w", encoding="utf-8") as f:
             json.dump(payload, f, ensure_ascii=False, indent=2)
 

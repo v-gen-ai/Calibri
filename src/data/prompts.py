@@ -1,10 +1,42 @@
+from typing import List
+import json
 from torch.utils.data import Dataset, DataLoader
 
-def get_lines(path, limit=-1):
-    with open(path, "r", encoding="utf-8") as f:
-        lines = [l.strip() for l in f.readlines()]
-    prompts = [l for l in lines if len(l) > 0]
-    
+def get_lines(path: str, limit: int = -1) -> List[str]:
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        lines: List[str] = []
+
+        if isinstance(data, list):
+            if all(isinstance(x, str) for x in data):
+                lines = data
+            elif all(isinstance(x, dict) and "prompt" in x for x in data):
+                lines = [str(x["prompt"]) for x in data if isinstance(x.get("prompt"), (str, int, float))]
+            else:
+                lines = [str(x) for x in data]
+        elif isinstance(data, dict):
+            if "prompts" in data and isinstance(data["prompts"], list):
+                cand = data["prompts"]
+                if all(isinstance(x, str) for x in cand):
+                    lines = cand
+                elif all(isinstance(x, dict) and "prompt" in x for x in cand):
+                    lines = [str(x["prompt"]) for x in cand if isinstance(x.get("prompt"), (str, int, float))]
+                else:
+                    lines = [str(x) for x in cand]
+            elif "lines" in data and isinstance(data["lines"], list):
+                lines = [str(x) for x in data["lines"]]
+            else:
+                lines = [str(v) for v in data.values() if isinstance(v, (str, int, float))]
+        else:
+            lines = [str(data)]
+
+    except json.JSONDecodeError:
+        with open(path, "r", encoding="utf-8") as f:
+            lines = [l.rstrip("\n") for l in f]
+
+    prompts = [l.strip() for l in lines if isinstance(l, str) and l.strip()]
+
     if limit is not None and limit > 0:
         prompts = prompts[:limit]
     return prompts

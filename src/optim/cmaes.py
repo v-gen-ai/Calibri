@@ -161,19 +161,6 @@ class CMAESTrainer:
 
             opts["bounds"] = [bounds_low, bounds_high]
 
-        # self.es = cma.CMAEvolutionStrategy(
-        #     x0=x0,
-        #     sigma0=float(cfg.optimize.initial_sigma),
-        #     inopts=opts,
-        # )
-
-        # # state
-        # self._train_iter = iter(self.train_loader) if self.train_loader is not None else None
-        # self.best_solution = x0.copy()
-        # self.best_train = -np.inf
-        # self.best_val = -np.inf
-        # self.patience = 0
-
         self.generation = 0
         resume_state = getattr(cfg.experiment, "resume_state", None)
         resume_json  = getattr(cfg.experiment, "resume_json",  None)
@@ -309,33 +296,6 @@ class CMAESTrainer:
         )
         return out.images
 
-    # def _eval_candidate_on_bucket(self, x: np.ndarray, bucket_prompts: List[str], seed: int) -> Dict[str, float]:
-    #     self._apply_x_via_pipeline(x)
-    #     total_scores = None
-    #     total_count = 0
-    #     micro_bs = int(self.cfg.data.batch_size)
-
-    #     for mini in _iter_chunks(bucket_prompts, micro_bs):
-    #         mini = list(mini)
-    #         shard_prompts = self._shard_list(mini)  # NEW
-
-    #         images = self._gen_images_batch(shard_prompts, seed)
-    #         scores = call_reward(self.reward_fn, images, shard_prompts)
-    #         sum_scores_local = mean_score(scores, mode="sum")
-
-    #         # Глобальные суммы по всем рангам
-    #         sum_scores = self._allreduce_score_sum(sum_scores_local)  # NEW
-    #         count = self._allreduce_count(len(shard_prompts))         # NEW
-
-    #         if total_scores is None:
-    #             total_scores = sum_scores
-    #         else:
-    #             for name, s in sum_scores.items():
-    #                 total_scores[name] += s
-    #         total_count += count
-
-    #     return {name: float(score) / float(total_count) for name, score in total_scores.items()}
-
     def _eval_candidate_on_bucket(self, x: np.ndarray, bucket_prompts: List[str], seed: int) -> Dict[str, float]:
         self._apply_x_via_pipeline(x)
         total_scores = None
@@ -464,6 +424,8 @@ class CMAESTrainer:
             "sigma": float(self.es.sigma),
             "timestamp": int(time.time()),
         }
+        run_dir = os.path.join(run_dir, f"step_{step}")
+        os.makedirs(run_dir, exist_ok=True)
         with open(os.path.join(run_dir, f"cmaes_step_{step:04d}.json"), "w", encoding="utf-8") as f:
             json.dump(payload, f, ensure_ascii=False, indent=2)
 

@@ -11,7 +11,7 @@ import cma
 from PIL import Image
 import torch.distributed as dist
 
-from src.utils.logging_tb import log_scalars, log_images, log_scatter
+from src.utils.logging_tb import log_scalars, log_images, log_scatter, log_model_scales
 from src.utils.utils import to_pil_list, call_reward, mean_score
 from src.data.prompts import get_lines
 
@@ -32,86 +32,17 @@ def _iter_chunks(seq, size):
     for i in tqdm(range(0, len(seq), size), desc="bucket iteration during train"):
         yield seq[i:i + size]
 
-
-def _transformer_dims(pipeline) -> Tuple[int, int, int]:
-    t = pipeline.pipeline.transformer
-    n_double = len(t.transformer_blocks)
-    n_single = len(t.single_transformer_blocks)
-    n_models = len(t.models_scales)
-    return n_double, n_single, n_models
-
-
-def _flatten_from_transformer(pipeline) -> np.ndarray:
-    t = pipeline.pipeline.transformer
-    n_double, n_single, n_models = _transformer_dims(pipeline)
-    vec = []
-    # doubles (attn, mlp)
-    for m in range(n_models):
-        for b in range(n_double):
-            w_attn, w_mlp = t.transformer_gate_scales[m][b]
-            vec.append(float(w_attn.detach().cpu().item()))
-            vec.append(float(w_mlp.detach().cpu().item()))
-    # singles
-    for m in range(n_models):
-        for b in range(n_single):
-            w = t.single_gate_scales[m][b]
-            vec.append(float(w.detach().cpu().item()))
-    # models_scales
-    ms = t.models_scales.detach().cpu().to(torch.float64).numpy().astype(np.float64).tolist()
-    vec.extend(ms)
-    return np.asarray(vec, dtype=np.float64)
-
-
-def _vector_shapes(pipeline) -> Dict[str, int]:
-    n_double, n_single, n_models = _transformer_dims(pipeline)
-    doubles = n_models * n_double * 2
-    singles = n_models * n_single
-    models = n_models
-    return {"doubles": doubles, "singles": singles, "models": models, "total": doubles + singles + models,
-            "n_double": n_double, "n_single": n_single, "n_models": n_models}
-
-
-def _unflatten_to_gs(x: np.ndarray, shapes: Dict[str, int]):
-    d_doubles = shapes["doubles"]
-    d_singles = shapes["singles"]
-    n_double = shapes["n_double"]
-    n_single = shapes["n_single"]
-    n_models = shapes["n_models"]
-
-    doubles = x[:d_doubles]
-    singles = x[d_doubles:d_doubles + d_singles]
-    models = x[d_doubles + d_singles:]
-
-    # build per-model
-    scales_double = []
-    scales_single = []
-
-    # doubles per model: n_double * 2
-    per_model_doubles = n_double * 2
-    for m in range(n_models):
-        md = []
-        start = m * per_model_doubles
-        for b in range(n_double):
-            a = doubles[start + 2 * b + 0]
-            c = doubles[start + 2 * b + 1]
-            md.append((float(a), float(c)))
-        scales_double.append(md)
-
-    # singles per model: n_single
-    for m in range(n_models):
-        ms = []
-        start = m * n_single
-        for b in range(n_single):
-            ms.append(float(singles[start + b]))
-        scales_single.append(ms)
-
-    models_scales = [float(v) for v in list(models)]
-    return scales_double, scales_single, models_scales
-
-
 class CMAESTrainer:
-    def __init__(self, cfg, pipeline, reward_fn, eval_reward_fn, writer, 
-                 train_loader, val_loader, logdir=None, accelerator=None):
+    def __init__(self, 
+                 cfg, 
+                 pipeline, 
+                 reward_fn, 
+                 eval_reward_fn, 
+                 writer, 
+                 train_loader, 
+                 val_loader, 
+                 logdir=None, 
+                 accelerator=None):
         self.cfg = cfg
         self.pipeline = pipeline  # SGFluxPipeline
         self.reward_fn = reward_fn
@@ -125,11 +56,11 @@ class CMAESTrainer:
         self.device = _get_device(cfg)
         self.gen_params = _gen_params(cfg)
 
-        self.shapes = _vector_shapes(self.pipeline)
+        self.shapes = self.pipeline.get_coefficient_shapes()
         self.dim = self.shapes["total"]
 
         # Initial point from current transformer state
-        x0 = _flatten_from_transformer(self.pipeline)
+        x0 = self.pipeline.flatten_coefficients()
 
         # CMA-ES options
         opts = {
@@ -138,32 +69,23 @@ class CMAESTrainer:
         if getattr(cfg.optimize, "population_size", None):
             opts["popsize"] = int(cfg.optimize.population_size)
 
-        bounds_low: List[float] = []
-        bounds_high: List[float] = []
-        has_bounds = False
 
-        if getattr(cfg.scaleguidance, "blocks_bound_low", None) is not None:
-            blocks_bound_low = cfg.optimize.blocks_bound_low
-            blocks_bound_high = cfg.optimize.blocks_bound_high
-            models_bound_low = cfg.optimize.models_bound_low
-            models_bound_high = cfg.optimize.models_bound_high
-            has_bounds = True
+        ## Here we use a constrained that flat vector is (blocks_params + model_scales)
+        ## It's good while pipelines follow that rule. But if you need more flexible bounds settings, you can do it through flat_to_struct and struct_to_flat methods
+        if getattr(cfg.optimize, "blocks_bound_low", None) is not None:
+            bounds_low = []
+            bounds_high = []
 
-        if has_bounds:
-            bounds_low.extend([float(blocks_bound_low)] * self.shapes["doubles"])
-            bounds_high.extend([float(blocks_bound_high)] * self.shapes["doubles"])
+            bounds_low.extend([float(cfg.optimize.blocks_bound_low)] * (self.shapes["total"] - self.shapes["n_models"]))
+            bounds_high.extend([float(cfg.optimize.blocks_bound_high)] * (self.shapes["total"] - self.shapes["n_models"]))
 
-            bounds_low.extend([float(blocks_bound_low)] * self.shapes["singles"])
-            bounds_high.extend([float(blocks_bound_high)] * self.shapes["singles"])
-
-            bounds_low.extend([float(models_bound_low)] * self.shapes["models"])
-            bounds_high.extend([float(models_bound_high)] * self.shapes["models"])
+            bounds_low.extend([float(cfg.optimize.models_bound_low)] * self.shapes["n_models"])
+            bounds_high.extend([float(cfg.optimize.models_bound_high)] * self.shapes["n_models"])
 
             opts["bounds"] = [bounds_low, bounds_high]
 
         self.generation = 0
         resume_state = getattr(cfg.experiment, "resume_state", None)
-        resume_json  = getattr(cfg.experiment, "resume_json",  None)
 
         if resume_state and os.path.isfile(resume_state):
             with open(resume_state, "rb") as f:
@@ -178,7 +100,6 @@ class CMAESTrainer:
             self.hist_train_best_scores = list(st.get("hist_train_best_scores", []))
             self.hist_val = list(st.get("hist_val", []))
             self.hist_sigma = list(st.get("hist_sigma", []))
-            self.hist_models_scales = list(st.get("hist_models_scales", []))
             # RNG
             if st.get("np_rng_state", None) is not None:
                 np.random.set_state(st["np_rng_state"])
@@ -187,23 +108,9 @@ class CMAESTrainer:
             if torch.cuda.is_available() and st.get("torch_cuda_rng_state_all", None) is not None:
                 torch.cuda.set_rng_state_all(st["torch_cuda_rng_state_all"])
         else:
-            # optional JSON resume: use saved solution as new x0 (+ optional sigma)
-            if resume_json and os.path.isfile(resume_json):
-                with open(resume_json, "r", encoding="utf-8") as f:
-                    payload = json.load(f)
-                x0 = np.asarray(payload["solution"], dtype=np.float64)
-                self.generation = int(payload.get("step", 0))
-                self.best_solution = x0.copy()
-                self.best_train = float(payload.get("train_best", -np.inf))
-                v = payload.get("val", None)
-                self.best_val = float(v) if v is not None else float("-inf")
-                if "sigma" in payload:
-                    opts["sigma0"] = float(payload["sigma"])
-            else:
-                self._train_iter = iter(self.train_loader) if self.train_loader is not None else None
-                self.best_solution = x0.copy()
-                self.best_train = -np.inf
-                self.best_val = -np.inf
+            self.best_solution = x0.copy()
+            self.best_train = -np.inf
+            self.best_val = -np.inf
 
             self.es = cma.CMAEvolutionStrategy(
                 x0=x0,
@@ -211,13 +118,15 @@ class CMAESTrainer:
                 inopts=opts,
             )
 
+        ## to-do: redo with sampler to support resume option
+        self._train_iter = iter(self.train_loader) if self.train_loader is not None else None
+
         # history
         self.hist_train_best: List[float] = []
         self.hist_train_best_scores: List[float] = []
         self.hist_train_mean: List[float] = []
         self.hist_val: List[Optional[float]] = []
         self.hist_sigma: List[float] = []
-        self.hist_models_scales: List[List[float]] = []
 
     def _is_dist(self):
         return dist.is_available() and dist.is_initialized()
@@ -273,15 +182,6 @@ class CMAESTrainer:
         batch = self._broadcast_object(batch, src=0)
         return list(batch)
 
-    def _apply_x_via_pipeline(self, x: np.ndarray):
-        scales_double, scales_single, models_scales = _unflatten_to_gs(x, self.shapes)
-        self.pipeline.modify_scaleguidance(
-            num_models=self.shapes["n_models"],
-            scales_double=scales_double,
-            scales_single=scales_single,
-            models_scales=models_scales,
-        )
-
     def _gen_images_batch(self, prompts: List[str], seed: int):
         # For fair comparison within a generation, fix generator
         gen_device = "cpu"  # reproducibility: CPU generator recommended by diffusers
@@ -296,28 +196,35 @@ class CMAESTrainer:
         )
         return out.images
 
-    def _eval_candidate_on_bucket(self, x: np.ndarray, bucket_prompts: List[str], seed: int) -> Dict[str, float]:
-        self._apply_x_via_pipeline(x)
+    def _eval_candidate_on_bucket(self, 
+                                  x: np.ndarray, 
+                                  bucket_prompts: List[str], 
+                                  seed: int) -> Dict[str, float]:
+        self.pipeline.apply_coefficients(x)
+
         total_scores = None
         total_count = 0
         micro_bs = int(self.cfg.data.batch_size)
         for mini in _iter_chunks(bucket_prompts, micro_bs):
-            mini = list(mini)  # ВАЖНО: не шардируем по рангам
+            mini = list(mini)
             images = self._gen_images_batch(mini, seed)
             scores = call_reward(self.reward_fn, images, mini)
             sum_scores = mean_score(scores, mode="sum")
+
             if total_scores is None:
                 total_scores = sum_scores
             else:
                 for name, s in sum_scores.items():
                     total_scores[name] += s
             total_count += len(mini)
+
         return {name: float(score) / float(total_count) for name, score in total_scores.items()}
 
     def _eval_validation(self, x: np.ndarray, seed: int = 1234,
                          save_dir: str | None = None, save_images: bool = False,
                          save_format: str = "png", save_limit: int | None = None) -> dict | None:
-        self._apply_x_via_pipeline(x)
+        self.pipeline.apply_coefficients(x)
+
         total_scores = None
         total_count = 0
         global_idx = 0
@@ -376,31 +283,26 @@ class CMAESTrainer:
         }
         log_scalars(self.writer, scalars, step)
 
-        # Восстанавливаем по-модельные коэффициенты
-        scales_double, scales_single, models_scales = _unflatten_to_gs(best_x, self.shapes)
-        n_models = self.shapes["n_models"]
-
-        # Разворачиваем в per-model массивы: attn, mlp, single
-        attn_by_model = [np.array([a for (a, _m) in scales_double[m]], dtype=np.float32) for m in range(n_models)]
-        mlp_by_model  = [np.array([m_ for (_a, m_) in scales_double[m]], dtype=np.float32) for m in range(n_models)]
-        single_by_model = [np.array(scales_single[m], dtype=np.float32) for m in range(n_models)]
+        x = self.pipeline.flatten_coefficients()
+        d = self.pipeline.flat_to_struct(x)
+        models_scales = d["models_scales"]
 
         alpha_dict = {
-            "double_attn": attn_by_model,         # список np.array по моделям
-            "double_mlp": mlp_by_model,           # список np.array по моделям
-            "single": single_by_model,            # список np.array по моделям
+            # "double_attn": attn_by_model,         # список np.array по моделям
+            # "double_mlp": mlp_by_model,           # список np.array по моделям
+            # "single": single_by_model,            # список np.array по моделям
             "models_scales": np.array(models_scales, dtype=np.float32),  # shape = [n_models]
         }
-        log_scatter(self.writer, alpha_dict, step, prefix="alphas/")
+        # log_scatter(self.writer, alpha_dict, step, prefix="alphas/")
+        log_model_scales(self.writer, alpha_dict, step, prefix="alphas/")
 
         self.hist_sigma.append(float(sigma))
-        self.hist_models_scales.append(np.asarray(models_scales, dtype=np.float32).tolist())
 
     def _maybe_log_images(self, step: int, x: np.ndarray, tag: str = "samples/test"):
         if not getattr(self.cfg.experiment, "test_dataset", False):
             return
+        self.pipeline.apply_coefficients(x)
         prompts = get_lines(self.cfg.experiment.test_dataset)
-        self._apply_x_via_pipeline(x)
         show_seed = int(getattr(self.cfg.experiment, "seed", 0)) + step + 777
         images = self._gen_images_batch(prompts, show_seed)
         log_images(self.writer, tag, images, step)
@@ -448,7 +350,6 @@ class CMAESTrainer:
             "hist_train_best_scores": self.hist_train_best_scores,
             "hist_val": self.hist_val,
             "hist_sigma": self.hist_sigma,
-            "hist_models_scales": self.hist_models_scales,
             "np_rng_state": np.random.get_state(),
             "torch_rng_state": torch.get_rng_state(),
             "torch_cuda_rng_state_all": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
@@ -464,7 +365,7 @@ class CMAESTrainer:
 
         ### eval orig model
         if self.cfg.experiment.eval_orig_model:
-            orig_x = _flatten_from_transformer(self.pipeline)
+            orig_x = self.pipeline.flatten_coefficients()
             val_score = self._eval_validation(orig_x, 
                                               save_dir=os.path.join(self.logdir, "eval", f"step_{generation}"), 
                                               save_images=getattr(self.cfg.data, "save_eval_imgs", None),
@@ -538,7 +439,10 @@ class CMAESTrainer:
 
             self._barrier()
 
-            do_val = int(self.cfg.optimize.val_every_steps) > 0 and (step % int(self.cfg.optimize.val_every_steps) == 0 or step == max_gens)
+            do_val = (
+                int(self.cfg.optimize.val_every_steps) > 0 
+                and (step % int(self.cfg.optimize.val_every_steps) == 0 or step == max_gens)
+            )
             if do_val:
                 best_sol = self._broadcast_object(self.best_solution if self._rank() == 0 else None, src=0)
                 best_sol = np.asarray(best_sol, dtype=np.float64)
@@ -555,7 +459,11 @@ class CMAESTrainer:
                     self._maybe_log_images(step, best_sol)
                     if val_score["avg"] > self.best_val:
                         self.best_val = float(val_score["avg"])
-                    self._checkpoint_json(step, self.best_train, float(self.hist_train_mean[-1]), self.hist_val[-1]["avg"], best_sol)
+                    self._checkpoint_json(step, 
+                                          self.best_train, 
+                                          float(self.hist_train_mean[-1]), 
+                                          self.hist_val[-1]["avg"], 
+                                          best_sol)
                     self._save_state(step)
             else:
                 if self._rank() == 0:

@@ -15,11 +15,11 @@ from accelerate import Accelerator
 import torch.distributed as dist
 
 import src.rewards
-from src.models.flux_sg import SGFluxPipeline
 from src.utils.utils import set_seed, save_config
 from src.utils.logging_tb import create_writer, NullWriter
 from src.data.prompts import make_loader
 from src.optim.cmaes import CMAESTrainer
+from src.models import get_pipeline_by_name
 
 _CONFIG = config_flags.DEFINE_config_file("config", "configs/base.py", "Training configuration.")
 
@@ -39,13 +39,13 @@ def main(_):
         inference_dtype = torch.bfloat16
 
     device = accelerator.device
-    pipeline = SGFluxPipeline(
+    pipeline = get_pipeline_by_name(cfg.model.model_name)(
         device=device,
         dtype=inference_dtype,
         model_name=cfg.model.model_name,
-        num_models=cfg.scaleguidance.num_models
+        num_models=cfg.scaleguidance.num_models,
+        verbose=False
     )
-    pipeline.pipeline.set_progress_bar_config(disable=True)
 
     reward_fn = getattr(src.rewards, 'multi_score')(cfg.device, cfg.reward_fn)
     eval_reward_fn = getattr(src.rewards, 'multi_score')(cfg.device, cfg.reward_fn_eval)
@@ -92,6 +92,7 @@ def main(_):
         train_loader, val_loader, logdir=final_logdir, accelerator=accelerator
     )
     best_solution, best_train, best_val = trainer.train()
+
     if accelerator.is_main_process:
         writer.close()
 

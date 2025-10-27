@@ -29,6 +29,23 @@ def log_hist_alphas(writer: SummaryWriter, alpha_dict: dict, step: int, prefix: 
         arr = np.asarray(arr)
         writer.add_histogram(f"{prefix}{name}", arr, step)
 
+def log_model_scales(writer: SummaryWriter, alpha_dict: dict, step: int, prefix: str):
+    def _save_fig_to_tb(fig, tag):
+        buf = io.BytesIO()
+        fig.savefig(buf, format="png", dpi=100, bbox_inches="tight")
+        plt.close(fig)
+        buf.seek(0)
+        img = Image.open(buf).convert("RGB")
+        writer.add_image(tag, torch.from_numpy(np.array(img)).permute(2, 0, 1), step)
+
+    if "models_scales" in alpha_dict:
+        ms = np.asarray(alpha_dict["models_scales"])
+        fig_ms, ax = plt.subplots(figsize=(8, 5))
+        ax.bar(np.arange(len(ms)), ms, color='blue')
+        ax.set_xlabel('Model Index'); ax.set_ylabel('Scale Value')
+        ax.set_title('Model Scales'); ax.grid(True)
+        _save_fig_to_tb(fig_ms, f"{prefix}models_scales")
+
 def log_images(writer: SummaryWriter, tag: str, pil_images, step: int, max_images=8):
     # склеивание не делаем, логируем первые N изображений поштучно
     for i, im in enumerate(pil_images[:max_images]):

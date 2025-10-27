@@ -13,7 +13,7 @@ To run the experiment:
 accelerate launch --num_processes 2 --config_file configs/2gpu.yaml scripts/train.py --config configs/scaleguidance.py:cmaes_hpsv3_2models
 ```
 
-You can find different configs at configs/gatescale.py
+You can find different configs at configs/scaleguidance.py
 
 Plots:
 ```

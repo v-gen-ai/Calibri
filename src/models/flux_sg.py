@@ -1,8 +1,11 @@
 import types
-from typing import Sequence
+from typing import Sequence, Dict, List, Optional, Any
 import torch
 import torch.nn as nn
+import numpy as np
 from diffusers import FluxPipeline
+
+from .base_sg import BaseSGPipeline
 
 
 def extend_transformer_with_sg(
@@ -150,26 +153,107 @@ def extend_transformer_with_sg(
     return model_transformer
 
 
-class SGFluxPipeline:
-    def __init__(self, device, dtype, model_name="black-forest-labs/FLUX.1-dev", num_models=1):
+class SGFluxPipeline(BaseSGPipeline):
+    def __init__(self, device, dtype, model_name="black-forest-labs/FLUX.1-dev", num_models=1, verbose=False):
         self.pipeline = FluxPipeline.from_pretrained(
             model_name,
             torch_dtype=dtype,
         ).to(device)
         self.pipeline.transformer = extend_transformer_with_sg(self.pipeline.transformer, num_models=num_models)
+        if not verbose:
+            self.pipeline.set_progress_bar_config(disable=True)
+    
+    def get_coefficient_shapes(self) -> Dict[str, int]:
+        """Get dimensions for FLUX coefficient vector"""
+        t = self.pipeline.transformer
+        n_double = len(t.transformer_blocks)
+        n_single = len(t.single_transformer_blocks)
+        n_models = len(t.models_scales)
+        
+        doubles = n_models * n_double * 2
+        singles = n_models * n_single
+        models = n_models
+        
+        return {
+            # must have
+            "total": doubles + singles + models,
+            "n_models": n_models,
+            # optional
+            "doubles": doubles,
+            "singles": singles,
+            "n_double": n_double,
+            "n_single": n_single,
+        }
 
-    def modify_scaleguidance(
-        self,
-        num_models: int = 1,
-        scales_double: Sequence[Sequence[tuple[float, float]]] = None,
-        scales_single: Sequence[Sequence[float]] = None,
-        models_scales: Sequence[float] = None
-    ):
-        self.pipeline.transformer = extend_transformer_with_sg(self.pipeline.transformer,
-                                                               num_models=num_models,
-                                                               scales_double=scales_double,
-                                                               scales_single=scales_single,
-                                                               models_scales=models_scales)
+    def flatten_coefficients(self) -> np.ndarray:
+        # как раньше: doubles(attn,mlp) -> singles -> models_scales  
+        t = self.pipeline.transformer
+        s = self.get_coefficient_shapes()
+        n_double, n_single, n_models = s["n_double"], s["n_single"], s["n_models"]
+        vec: List[float] = []
+        for m in range(n_models):
+            for b in range(n_double):
+                w_attn, w_mlp = t.transformer_gate_scales[m][b]
+                vec += [float(w_attn.detach().cpu().item()), float(w_mlp.detach().cpu().item())]
+        for m in range(n_models):
+            for b in range(n_single):
+                vec.append(float(t.single_gate_scales[m][b].detach().cpu().item()))
+        vec += t.models_scales.detach().cpu().to(torch.float64).numpy().tolist()
+        return np.asarray(vec, dtype=np.float64)
 
-    def __call__(self, *args, **kwargs):
-        return self.pipeline(*args, **kwargs)
+    def flat_to_struct(self, x: Optional[np.ndarray] = None) -> Dict[str, Any]:
+        if x is None:
+            x = self.flatten_coefficients()
+        s = self.get_coefficient_shapes()
+        d_d, d_s = s["doubles"], s["singles"]
+        n_double, n_single, n_models = s["n_double"], s["n_single"], s["n_models"]
+        doubles = x[:d_d]; singles = x[d_d:d_d + d_s]; models = x[d_d + d_s:]  
+
+        scales_double: List[List[tuple]] = []
+        per_model_doubles = n_double * 2
+        for m in range(n_models):
+            start = m * per_model_doubles
+            md = [(float(doubles[start + 2*b + 0]), float(doubles[start + 2*b + 1])) for b in range(n_double)]
+            scales_double.append(md)
+        scales_single: List[List[float]] = []
+        for m in range(n_models):
+            start = m * n_single
+            ms = [float(singles[start + b]) for b in range(n_single)]
+            scales_single.append(ms)
+        models_scales = [float(v) for v in models]  
+
+        return {
+            "num_models": n_models,
+            "scales_double": scales_double,
+            "scales_single": scales_single,
+            "models_scales": models_scales,
+        }
+
+    def struct_to_flat(self, sdict: Dict[str, Any]) -> np.ndarray:
+        s = self.get_coefficient_shapes()
+        n_double, n_single, n_models = s["n_double"], s["n_single"], s["n_models"]
+        sd = sdict["scales_double"]; ss = sdict["scales_single"]; ms = sdict["models_scales"]
+        assert len(sd) == n_models and len(ss) == n_models and len(ms) == n_models  
+        vec: List[float] = []
+        for m in range(n_models):
+            assert len(sd[m]) == n_double and all(len(p) == 2 for p in sd[m])
+            for b in range(n_double):
+                vec += [float(sd[m][b][0]), float(sd[m][b][1])]
+        for m in range(n_models):
+            assert len(ss[m]) == n_single
+            vec += [float(v) for v in ss[m]]
+        vec += [float(v) for v in ms]
+        return np.asarray(vec, dtype=np.float64)
+
+    def apply_coefficients(self, x: np.ndarray) -> None:
+        kwargs = self.flat_to_struct(x)
+        self.pipeline.transformer = extend_transformer_with_sg(self.pipeline.transformer, **kwargs)
+
+    def __call__(self, prompts, num_inference_steps, guidance_scale, height, width, generator, **kwargs):
+        return self.pipeline(prompts,
+                             num_inference_steps=num_inference_steps,
+                             guidance_scale=guidance_scale,
+                             height=height,
+                             width=width,
+                             generator=generator,
+                             **kwargs)

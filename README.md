@@ -52,10 +52,6 @@ SwanLab provides cloud-based experiment tracking with real-time monitoring.
 - `cmaes_qwen_hpsv3_swanlab`: Qwen-Image with SwanLab
 - `cmaes_hpsv3_2models_swanlab`: FLUX with SwanLab
 
-**Test SwanLab integration:**
-```bash
-python scripts/test_swanlab.py
-```
 
 **Run with SwanLab:**
 ```bash
@@ -65,4 +61,3 @@ accelerate launch --num_processes 2 --config_file configs/2gpu.yaml scripts/trai
 ## Documentation
 
 - **Qwen-Image Integration**: [QWEN_INTEGRATION.md](QWEN_INTEGRATION.md)
-- **SwanLab Integration**: [SWANLAB_INTEGRATION.md](SWANLAB_INTEGRATION.md)

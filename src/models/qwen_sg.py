@@ -4,7 +4,6 @@ import torch
 import torch.nn as nn
 import numpy as np
 from diffusers import DiffusionPipeline
-
 from .base_sg import BaseSGPipeline
 
 

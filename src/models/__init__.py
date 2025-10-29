@@ -5,5 +5,8 @@ def get_pipeline_by_name(model_name):
     elif model_name == "black-forest-labs/FLUX.1-dev":
         from .flux_sg import SGFluxPipeline
         return SGFluxPipeline
+    elif model_name == "Qwen/Qwen-Image":
+        from .qwen_sg import SGQwenPipeline
+        return SGQwenPipeline
     else:
         raise NameError("unknown model name")

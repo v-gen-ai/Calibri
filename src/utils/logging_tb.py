@@ -6,6 +6,13 @@ import torch
 from torch.utils.tensorboard import SummaryWriter
 import numpy as np
 
+# Import SwanLab logging if available
+try:
+    from .swanlab_logging import SwanLabWriter, DualWriter, create_swanlab_writer, create_dual_writer
+    SWANLAB_AVAILABLE = True
+except ImportError:
+    SWANLAB_AVAILABLE = False
+
 
 class NullWriter:
     def add_scalar(self, *args, **kwargs): 
@@ -16,20 +23,25 @@ class NullWriter:
         pass
 
 
-def create_writer(log_dir):
-    return SummaryWriter(log_dir=log_dir)
+def create_writer(log_dir, use_swanlab=False, project_name="ScaleGuidance", 
+                 experiment_name=None, api_key=None):
+    """Create writer with optional SwanLab support"""
+    if use_swanlab and SWANLAB_AVAILABLE:
+        return create_dual_writer(log_dir, project_name, experiment_name, api_key)
+    else:
+        return SummaryWriter(log_dir=log_dir)
 
-def log_scalars(writer: SummaryWriter, scalars: dict, step: int, prefix: str = ""):
+def log_scalars(writer, scalars: dict, step: int, prefix: str = ""):
     for k, v in scalars.items():
         writer.add_scalar(f"{prefix}{k}", v, step)
 
-def log_hist_alphas(writer: SummaryWriter, alpha_dict: dict, step: int, prefix: str):
+def log_hist_alphas(writer, alpha_dict: dict, step: int, prefix: str):
     # alpha_dict: {'double_alpha_attn': np.array([...]), ...}
     for name, arr in alpha_dict.items():
         arr = np.asarray(arr)
         writer.add_histogram(f"{prefix}{name}", arr, step)
 
-def log_model_scales(writer: SummaryWriter, alpha_dict: dict, step: int, prefix: str):
+def log_model_scales(writer, alpha_dict: dict, step: int, prefix: str):
     def _save_fig_to_tb(fig, tag):
         buf = io.BytesIO()
         fig.savefig(buf, format="png", dpi=100, bbox_inches="tight")
@@ -46,12 +58,12 @@ def log_model_scales(writer: SummaryWriter, alpha_dict: dict, step: int, prefix:
         ax.set_title('Model Scales'); ax.grid(True)
         _save_fig_to_tb(fig_ms, f"{prefix}models_scales")
 
-def log_images(writer: SummaryWriter, tag: str, pil_images, step: int, max_images=8):
+def log_images(writer, tag: str, pil_images, step: int, max_images=8):
     # склеивание не делаем, логируем первые N изображений поштучно
     for i, im in enumerate(pil_images[:max_images]):
         writer.add_image(f"{tag}/{i}", torch.from_numpy(np.array(im)).permute(2,0,1), step)
 
-def log_scatter(writer: "SummaryWriter", alpha_dict: dict, step: int, prefix: str):
+def log_scatter(writer, alpha_dict: dict, step: int, prefix: str):
 
     # Ветвь для по-модельных массивов (список массивов для attn/mlp/single)
     is_multi = isinstance(alpha_dict.get("double_attn"), (list, tuple)) \

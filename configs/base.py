@@ -1,6 +1,5 @@
 from ml_collections import ConfigDict
 
-
 def get_config():
     cfg = ConfigDict()
     cfg.device = "cuda"
@@ -45,5 +44,6 @@ def get_config():
     cfg.data.drop_last = True
     cfg.data.limit_train = -1
     cfg.data.limit_val = -1
+    cfg.data.val_cut_cnt = None
 
     return cfg

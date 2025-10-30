@@ -66,21 +66,7 @@ def main(_):
         final_logdir = container[0]
 
     # writer: only on main, others use NullWriter (no files)
-    use_swanlab = getattr(cfg.experiment, "use_swanlab", False)
-    swanlab_api_key = getattr(cfg.experiment, "swanlab_api_key", None)
-    swanlab_project = getattr(cfg.experiment, "swanlab_project", "ScaleGuidance")
-    swanlab_experiment = getattr(cfg.experiment, "swanlab_experiment", cfg.experiment.name)
-    
-    if accelerator.is_main_process:
-        writer = create_writer(
-            final_logdir, 
-            use_swanlab=use_swanlab,
-            project_name=swanlab_project,
-            experiment_name=swanlab_experiment,
-            api_key=swanlab_api_key
-        )
-    else:
-        writer = NullWriter()
+    writer = create_writer(final_logdir) if accelerator.is_main_process else NullWriter()
 
     train_loader = make_loader(
         cfg.data.train_dataset, 
@@ -93,12 +79,12 @@ def main(_):
     )
     val_loader = make_loader(
         cfg.data.val_dataset, 
-        cfg.data.batch_size, 
+        cfg.data.batch_size_val, 
         0, 
         False, 
-        False, 
+        cfg.data.drop_last,  # False 
         limit=cfg.data.limit_val, 
-        # cut_cnt=1
+        cut_cnt=getattr(cfg.data, "val_cut_cnt", None)
     )
 
     trainer = CMAESTrainer(

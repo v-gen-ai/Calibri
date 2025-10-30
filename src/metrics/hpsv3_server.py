@@ -42,7 +42,7 @@ class Handler(BaseHTTPRequestHandler):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--host", default="127.0.0.1")
-    parser.add_argument("--port", type=int, default=18087)
+    parser.add_argument("--port", type=int, default=18067)  # 18087
     parser.add_argument("--device", default="cuda")
     args = parser.parse_args()
 

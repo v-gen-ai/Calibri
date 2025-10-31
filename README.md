@@ -45,18 +45,6 @@ You can find different configs at `configs/scaleguidance.py`:
 tensorboard --logdir=<exp_logdir>
 ```
 
-### SwanLab (Cloud Dashboard)
-SwanLab provides cloud-based experiment tracking with real-time monitoring.
-
-**Available SwanLab configurations:**
-- `cmaes_qwen_hpsv3_swanlab`: Qwen-Image with SwanLab
-- `cmaes_hpsv3_2models_swanlab`: FLUX with SwanLab
-
-
-**Run with SwanLab:**
-```bash
-accelerate launch --num_processes 2 --config_file configs/2gpu.yaml scripts/train.py --config configs/scaleguidance.py:cmaes_qwen_hpsv3_swanlab
-```
 
 ## Documentation
 

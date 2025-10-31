@@ -79,12 +79,12 @@ def main(_):
     )
     val_loader = make_loader(
         cfg.data.val_dataset, 
-        cfg.data.batch_size, 
+        cfg.data.batch_size_val, 
         0, 
         False, 
-        False, 
+        cfg.data.drop_last,  # False 
         limit=cfg.data.limit_val, 
-        # cut_cnt=1
+        cut_cnt=getattr(cfg.data, "val_cut_cnt", None)
     )
 
     trainer = CMAESTrainer(

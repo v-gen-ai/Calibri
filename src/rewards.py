@@ -583,7 +583,7 @@ def hpsv3score_remote(device, url=None):
     from PIL import Image
     import torch
 
-    url = url or os.environ.get("HPSV3_URL", "http://127.0.0.1:18087")
+    url = url or os.environ.get("HPSV3_URL", "http://127.0.0.1:18067") # 18087
     batch_size = 8
 
     sess = requests.Session()

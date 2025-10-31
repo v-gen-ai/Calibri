@@ -118,6 +118,9 @@ class CMAESTrainer:
                 inopts=opts,
             )
 
+            ### make sure x0 is in first candidates
+            self.es.inject([self.es.gp.geno(x0)], force=True)
+
         ## to-do: redo with sampler to support resume option
         self._train_iter = iter(self.train_loader) if self.train_loader is not None else None
 
@@ -182,10 +185,9 @@ class CMAESTrainer:
         batch = self._broadcast_object(batch, src=0)
         return list(batch)
 
-    def _gen_images_batch(self, prompts: List[str], seed: int):
+    def _gen_images_batch(self, prompts: List[str], generator):
         # For fair comparison within a generation, fix generator
-        gen_device = "cpu"  # reproducibility: CPU generator recommended by diffusers
-        generator = torch.Generator(device=gen_device).manual_seed(int(seed))
+        
         out = self.pipeline(
             prompts,
             num_inference_steps=self.gen_params["num_inference_steps"],
@@ -204,10 +206,14 @@ class CMAESTrainer:
 
         total_scores = None
         total_count = 0
-        micro_bs = int(self.cfg.data.batch_size)
+        micro_bs = int(self.cfg.data.batch_size_train)
+
+        gen_device = "cpu"  # reproducibility: CPU generator recommended by diffusers
+        generator = torch.Generator(device=gen_device).manual_seed(int(seed))
+
         for mini in _iter_chunks(bucket_prompts, micro_bs):
             mini = list(mini)
-            images = self._gen_images_batch(mini, seed)
+            images = self._gen_images_batch(mini, generator)
             scores = call_reward(self.reward_fn, images, mini)
             sum_scores = mean_score(scores, mode="sum")
 
@@ -233,6 +239,11 @@ class CMAESTrainer:
         for prompts in tqdm(self.val_loader, desc="Validating", total=len(self.val_loader)):
             prompts = list(prompts)
             shard_prompts = self._shard_list(prompts)
+
+            # skip empty shards to avoid tokenizer errors on some ranks when
+            # batch_size is not divisible by world size
+            if len(shard_prompts) == 0:
+                continue
 
             generator = torch.Generator(device=gen_device).manual_seed(int(seed))
             with torch.inference_mode():
@@ -298,14 +309,16 @@ class CMAESTrainer:
 
         self.hist_sigma.append(float(sigma))
 
-    def _maybe_log_images(self, step: int, x: np.ndarray, tag: str = "samples/test"):
-        if not getattr(self.cfg.experiment, "test_dataset", False):
-            return
-        self.pipeline.apply_coefficients(x)
-        prompts = get_lines(self.cfg.experiment.test_dataset)
-        show_seed = int(getattr(self.cfg.experiment, "seed", 0)) + step + 777
-        images = self._gen_images_batch(prompts, show_seed)
-        log_images(self.writer, tag, images, step)
+    #def _maybe_log_images(self, step: int, x: np.ndarray, tag: str = "samples/test"):
+     #   if not getattr(self.cfg.experiment, "test_dataset", False):
+     #       return
+     #   self.pipeline.apply_coefficients(x)
+     #   prompts = get_lines(self.cfg.experiment.test_dataset)
+     #   show_seed = int(getattr(self.cfg.experiment, "seed", 0)) + step + 777
+     #   gen_device = "cpu"  # reproducibility: CPU generator recommended by diffusers
+     #   generator = torch.Generator(device=gen_device).manual_seed(int(show_seed))
+     #   images = self._gen_images_batch(prompts, generator)
+  #   log_images(self.writer, tag, images, step)
 
     def _checkpoint_json(self, step: int, best_fit: float, mean_fit: float, val_fit: Optional[float], best_x: np.ndarray):
         if getattr(self.cfg.experiment, "save_json", None) is None:
@@ -373,7 +386,7 @@ class CMAESTrainer:
             if self._rank() == 0:
                 for name, score in val_score.items():
                     log_scalars(self.writer, {f"val/{name}": float(score)}, generation)
-                self._maybe_log_images(generation, orig_x)
+                # self._maybe_log_images(generation, orig_x)
                 self._checkpoint_json(generation, -1.0, -1.0, val_score["avg"], orig_x)
                 self._save_state(generation)
 
@@ -456,7 +469,7 @@ class CMAESTrainer:
                     self.hist_val.append(val_score)
                     for name, score in val_score.items():
                         log_scalars(self.writer, {f"val/{name}": float(score)}, step)
-                    self._maybe_log_images(step, best_sol)
+                    # self._maybe_log_images(step, best_sol)
                     if val_score["avg"] > self.best_val:
                         self.best_val = float(val_score["avg"])
                     self._checkpoint_json(step, 
@@ -485,3 +498,5 @@ class CMAESTrainer:
         )
         best_solution = np.asarray(result["x"], dtype=np.float64)
         return best_solution, result["best_train"], result["best_val"]
+
+# noop: re-commit

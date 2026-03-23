@@ -11,82 +11,61 @@ from .base_sg import BaseSGPipeline
 def extend_transformer_with_sg(
     model_transformer,
     num_models: int = 1,
-    scales_double: Sequence[Sequence[tuple[float, float]]] = None,
-    scales_double_ctx: Optional[Sequence[Sequence[tuple[float, float]]]] = None,
+    scales_double: Sequence[Sequence[float]] = None,
     scales_single: Sequence[Sequence[float]] = None,
     models_scales: Sequence[float] = None
 ):
     """
-    Modifies the transformer by adding trainable scaling factors for gates
-    in double blocks (attn, mlp) and single blocks, with separate initialization for each block.
+    Adds trainable scaling factors:
+    - double blocks: one shared scalar per block (applies to attn and mlp, both main/context)
+    - single blocks: one scalar per block
 
-    Scaling order:
-    1) All double blocks in order, each containing a tuple (w_attn, w_mlp).
-    2) All single blocks in order, each containing a scalar w.
-
-    scales_double: list[num_models][num_double_blocks] -> (attn, mlp)
+    scales_double: list[num_models][num_double_blocks] -> w
     scales_single: list[num_models][num_single_blocks] -> w
     """
     n_double = len(model_transformer.transformer_blocks)
     n_single = len(model_transformer.single_transformer_blocks)
 
-    # Normalize/validate scales_double
+    # Defaults
     if scales_double is None:
-        scales_double = [[(1.0, 1.0) for _ in range(n_double)] for _ in range(num_models)]
-    
-    if scales_double_ctx is None:
-        scales_double_ctx = [[(1.0, 1.0) for _ in range(n_double)] for _ in range(num_models)]
-    
+        scales_double = [[1.0 for _ in range(n_double)] for _ in range(num_models)]
     if scales_single is None:
         scales_single = [[1.0 for _ in range(n_single)] for _ in range(num_models)]
-    
     if models_scales is None:
         models_scales = [0.0 for _ in range(num_models)]
         models_scales[0] = 1.0
 
+    # Validate
     assert len(scales_double) == num_models, "Length of scales_double doesn't correspond to num_models"
     assert len(scales_single) == num_models, "Length of scales_single doesn't correspond to num_models"
     assert len(models_scales) == num_models, "Length of models_scales doesn't correspond to num_models"
     assert len(scales_double[0]) == n_double, "Shape of scales_double doesn't correspond to number of double blocks in FLUX"
-    assert len(scales_single[0]) == n_single, "Shape of scales_double doesn't correspond to number of double blocks in FLUX"
-    assert all([len(elem) == 2 for vec_model in scales_double for elem in vec_model]), "Each double block need 2 scale params"
-    
+    assert len(scales_single[0]) == n_single, "Shape of scales_single doesn't correspond to number of single blocks in FLUX"
+
     device = next(model_transformer.parameters()).device
     dtype = next(model_transformer.parameters()).dtype
 
-    # Freeze base model
+    # Freeze base
     for p in model_transformer.parameters():
         p.requires_grad = False
 
-    # Preserve original forward
+    # Save original forward once
     if not hasattr(model_transformer, "_original_forward"):
         model_transformer._original_forward = model_transformer.forward
 
-    # Create per-block learnable gate scales
+    # Double blocks: shared scalar across main/context and across attn/mlp
     model_transformer.transformer_gate_scales_main = nn.ModuleList()
     for m in range(num_models):
         model_coeffs = nn.ModuleList()
         for b in range(n_double):
-            attn_init, mlp_init = scales_double[m][b]
+            w_init = scales_double[m][b]
             block_params = nn.ParameterList([
-                nn.Parameter(torch.tensor(attn_init, device=device, dtype=dtype)),
-                nn.Parameter(torch.tensor(mlp_init, device=device, dtype=dtype)),
+                nn.Parameter(torch.tensor(w_init, device=device, dtype=dtype)),
             ])
             model_coeffs.append(block_params)
         model_transformer.transformer_gate_scales_main.append(model_coeffs)
-    
-    model_transformer.transformer_gate_scales_ctx = nn.ModuleList()
-    for m in range(num_models):
-        model_coeffs = nn.ModuleList()
-        for b in range(n_double):
-            c_attn_init, c_mlp_init = scales_double_ctx[m][b]
-            block_params = nn.ParameterList([
-                nn.Parameter(torch.tensor(c_attn_init, device=device, dtype=dtype)),
-                nn.Parameter(torch.tensor(c_mlp_init, device=device, dtype=dtype)),
-            ])
-            model_coeffs.append(block_params)
-        model_transformer.transformer_gate_scales_ctx.append(model_coeffs)
 
+    # Single blocks: unchanged
     model_transformer.single_gate_scales = nn.ModuleList()
     for m in range(num_models):
         plist = nn.ParameterList([
@@ -95,28 +74,27 @@ def extend_transformer_with_sg(
         ])
         model_transformer.single_gate_scales.append(plist)
 
-    # Blending weights for models
+    # Model blend weights
     initial_scales = torch.tensor(models_scales, device=device, dtype=dtype)
     model_transformer.models_scales = nn.Parameter(initial_scales)
 
     # Hook storage
     model_transformer._gate_hooks = []
 
-    def _create_transformer_hook(block_idx: int, model_idx: int, is_context: bool):
+    # Double-block hook: apply same w to attn and mlp gates
+    def _create_transformer_hook(block_idx: int, model_idx: int, is_context: bool = False):
         def hook(module, args, kwargs, output):
             if isinstance(output, (tuple, list)):
                 out_list = list(output)
-                if not is_context:
-                    w_attn, w_mlp = model_transformer.transformer_gate_scales_main[model_idx][block_idx]
-                else:
-                    w_attn, w_mlp = model_transformer.transformer_gate_scales_ctx[model_idx][block_idx]
+                w = model_transformer.transformer_gate_scales_main[model_idx][block_idx][0]
                 # assumes positions [1] -> gate_msa, [4] -> gate_mlp
-                out_list[1] = out_list[1] * w_attn
-                out_list[4] = out_list[4] * w_mlp
+                out_list[1] = out_list[1] * w
+                out_list[4] = out_list[4] * w
                 return tuple(out_list)
             return output
         return hook
 
+    # Single-block hook: unchanged
     def _create_single_hook(block_idx, model_idx):
         def hook(module, args, kwargs, output):
             w = model_transformer.single_gate_scales[model_idx][block_idx]
@@ -130,8 +108,10 @@ def extend_transformer_with_sg(
 
     def _register_hooks(self, model_idx):
         for idx, block in enumerate(self.transformer_blocks):
+            # main
             h1 = block.norm1.register_forward_hook(_create_transformer_hook(idx, model_idx, is_context=False), with_kwargs=True)
             self._gate_hooks.append(h1)
+            # context (same shared weights)
             if hasattr(block, "norm1_context") and block.norm1_context is not None:
                 h2 = block.norm1_context.register_forward_hook(_create_transformer_hook(idx, model_idx, is_context=True), with_kwargs=True)
                 self._gate_hooks.append(h2)
@@ -172,40 +152,36 @@ def extend_transformer_with_sg(
     return model_transformer
 
 
-class SGFluxPipeline(BaseSGPipeline):
-    def __init__(self, device, dtype, model_name="black-forest-labs/FLUX.1-dev", num_models=1, verbose=False):
+class SGFluxPipelineBlock(BaseSGPipeline):
+    def __init__(self, device, dtype, model_name="flux_block", num_models=1, verbose=False):
         self.pipeline = FluxPipeline.from_pretrained(
-            model_name,
+            "black-forest-labs/FLUX.1-dev",
             torch_dtype=dtype,
         ).to(device)
         self.pipeline.transformer = extend_transformer_with_sg(self.pipeline.transformer, num_models=num_models)
         if not verbose:
             self.pipeline.set_progress_bar_config(disable=True)
-    
+
     def get_coefficient_shapes(self) -> Dict[str, int]:
         """Get dimensions for FLUX coefficient vector"""
         t = self.pipeline.transformer
         n_double = len(t.transformer_blocks)
         n_single = len(t.single_transformer_blocks)
         n_models = len(t.models_scales)
-        
-        doubles_main = n_models * n_double * 2   # (attn, mlp)
-        doubles_ctx  = n_models * n_double * 2   # (c_attn, c_mlp)
+
+        doubles_main = n_models * n_double     # one scalar per double block (shared main/context, attn/mlp)
         singles = n_models * n_single
         models = n_models
-        
+
         return {
-            # must have
-            "total": doubles_main + doubles_ctx + singles + models,
+            "total": doubles_main + singles + models,
             "n_models": n_models,
-            # optional
             "doubles_main": doubles_main,
-            "doubles_ctx": doubles_ctx,
             "singles": singles,
             "n_double": n_double,
             "n_single": n_single,
         }
-    
+
     def flatten_coefficients(self) -> np.ndarray:
         t = self.pipeline.transformer
         s = self.get_coefficient_shapes()
@@ -213,12 +189,8 @@ class SGFluxPipeline(BaseSGPipeline):
         vec: List[float] = []
         for m in range(n_models):
             for b in range(n_double):
-                w_attn, w_mlp = t.transformer_gate_scales_main[m][b]
-                vec += [float(w_attn.detach().cpu().item()), float(w_mlp.detach().cpu().item())]
-        for m in range(n_models):
-            for b in range(n_double):
-                w_c_attn, w_c_mlp = t.transformer_gate_scales_ctx[m][b]
-                vec += [float(w_c_attn.detach().cpu().item()), float(w_c_mlp.detach().cpu().item())]
+                w = t.transformer_gate_scales_main[m][b][0]
+                vec.append(float(w.detach().cpu().item()))
         for m in range(n_models):
             for b in range(n_single):
                 vec.append(float(t.single_gate_scales[m][b].detach().cpu().item()))
@@ -229,28 +201,21 @@ class SGFluxPipeline(BaseSGPipeline):
         if x is None:
             x = self.flatten_coefficients()
         s = self.get_coefficient_shapes()
-        d_m, d_c, d_s = s["doubles_main"], s["doubles_ctx"], s["singles"]
+        d_m, d_s = s["doubles_main"], s["singles"]
         n_double, n_single, n_models = s["n_double"], s["n_single"], s["n_models"]
 
         off = 0
         doubles_main = x[off:off + d_m]; off += d_m
-        doubles_ctx  = x[off:off + d_c]; off += d_c
         singles      = x[off:off + d_s]; off += d_s
         models       = x[off:]
 
-        per_model_doubles = n_double * 2
+        per_model_doubles = n_double
 
-        scales_double: List[List[tuple[float, float]]] = []
+        scales_double: List[List[float]] = []
         for m in range(n_models):
             start = m * per_model_doubles
-            md = [(float(doubles_main[start + 2*b + 0]), float(doubles_main[start + 2*b + 1])) for b in range(n_double)]
+            md = [float(doubles_main[start + b]) for b in range(n_double)]
             scales_double.append(md)
-
-        scales_double_ctx: List[List[tuple[float, float]]] = []
-        for m in range(n_models):
-            start = m * per_model_doubles
-            md = [(float(doubles_ctx[start + 2*b + 0]), float(doubles_ctx[start + 2*b + 1])) for b in range(n_double)]
-            scales_double_ctx.append(md)
 
         scales_single: List[List[float]] = []
         for m in range(n_models):
@@ -262,8 +227,7 @@ class SGFluxPipeline(BaseSGPipeline):
 
         return {
             "num_models": n_models,
-            "scales_double": scales_double,          # main
-            "scales_double_ctx": scales_double_ctx,  # context
+            "scales_double": scales_double,  # one per double block, shared main/context and attn/mlp
             "scales_single": scales_single,
             "models_scales": models_scales,
         }
@@ -271,22 +235,16 @@ class SGFluxPipeline(BaseSGPipeline):
     def struct_to_flat(self, sdict: Dict[str, Any]) -> np.ndarray:
         s = self.get_coefficient_shapes()
         n_double, n_single, n_models = s["n_double"], s["n_single"], s["n_models"]
-        sd  = sdict["scales_double"]           # main
-        sdc = sdict["scales_double_ctx"]       # context
+        sd  = sdict["scales_double"]
         ss  = sdict["scales_single"]
         ms  = sdict["models_scales"]
 
-        assert len(sd) == n_models and len(sdc) == n_models and len(ss) == n_models and len(ms) == n_models
+        assert len(sd) == n_models and len(ss) == n_models and len(ms) == n_models
 
         vec: List[float] = []
         for m in range(n_models):
-            assert len(sd[m]) == n_double and all(len(p) == 2 for p in sd[m])
-            for b in range(n_double):
-                vec += [float(sd[m][b][0]), float(sd[m][b][1])]
-        for m in range(n_models):
-            assert len(sdc[m]) == n_double and all(len(p) == 2 for p in sdc[m])
-            for b in range(n_double):
-                vec += [float(sdc[m][b][0]), float(sdc[m][b][1])]
+            assert len(sd[m]) == n_double
+            vec += [float(v) for v in sd[m]]
         for m in range(n_models):
             assert len(ss[m]) == n_single
             vec += [float(v) for v in ss[m]]

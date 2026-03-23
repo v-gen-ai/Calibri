@@ -8,8 +8,7 @@ def get_config():
     cfg.experiment.name = "flux_autoguidance_cmaes"
     cfg.experiment.seed = 42
     cfg.experiment.log_dir = "logs"
-    cfg.experiment.save_images = False
-    cfg.experiment.test_dataset = "data/test_log.txt"
+    cfg.experiment.save_eval_imgs = False
     cfg.experiment.save_json = True
     cfg.experiment.eval_orig_model = True
 
@@ -19,6 +18,7 @@ def get_config():
 
     cfg.gen = ConfigDict()
     cfg.gen.num_inference_steps = 15
+    cfg.gen.num_inference_steps_val = 15
     cfg.gen.guidance_scale = 3.5
     cfg.gen.image_size = 512
 
@@ -26,11 +26,9 @@ def get_config():
 
     cfg.optimize = ConfigDict()
     cfg.optimize.initial_sigma = 0.25
-    cfg.optimize.max_generations = 50
+    cfg.optimize.max_generations = -1
     cfg.optimize.population_size = None
-    cfg.optimize.val_every_steps = 3
-    cfg.optimize.early_stopping_patience = 10
-    cfg.optimize.overfitting_threshold = 0.15
+    cfg.optimize.val_every_steps = 10
     cfg.optimize.blocks_bound_low = -1.0
     cfg.optimize.blocks_bound_high = 2.0
     cfg.optimize.models_bound_low = -10.0
@@ -38,7 +36,8 @@ def get_config():
     cfg.optimize.bucket_size = 16
 
     cfg.data = ConfigDict()
-    cfg.data.batch_size = 4
+    cfg.data.batch_size_train = 4
+    cfg.data.batch_size_val = 4
     cfg.data.num_workers = 2
     cfg.data.shuffle = True
     cfg.data.drop_last = True

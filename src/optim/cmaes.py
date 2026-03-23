@@ -23,6 +23,7 @@ def _get_device(cfg) -> torch.device:
 def _gen_params(cfg) -> Dict:
     return {
         "num_inference_steps": int(cfg.gen.num_inference_steps),
+        "num_inference_steps_val": int(cfg.gen.num_inference_steps_val),
         "guidance_scale": float(cfg.gen.guidance_scale),
         "height": int(cfg.gen.image_size),
         "width": int(cfg.gen.image_size),
@@ -76,11 +77,14 @@ class CMAESTrainer:
             bounds_low = []
             bounds_high = []
 
-            bounds_low.extend([float(cfg.optimize.blocks_bound_low)] * (self.shapes["total"] - self.shapes["n_models"]))
-            bounds_high.extend([float(cfg.optimize.blocks_bound_high)] * (self.shapes["total"] - self.shapes["n_models"]))
+            n_models = self.shapes.get("models_len", None)
+            if n_models is None:
+                n_models = self.shapes["n_models"]
+            bounds_low.extend([float(cfg.optimize.blocks_bound_low)] * (self.shapes["total"] - n_models))
+            bounds_high.extend([float(cfg.optimize.blocks_bound_high)] * (self.shapes["total"] - n_models))
 
-            bounds_low.extend([float(cfg.optimize.models_bound_low)] * self.shapes["n_models"])
-            bounds_high.extend([float(cfg.optimize.models_bound_high)] * self.shapes["n_models"])
+            bounds_low.extend([float(cfg.optimize.models_bound_low)] * n_models)
+            bounds_high.extend([float(cfg.optimize.models_bound_high)] * n_models)
 
             opts["bounds"] = [bounds_low, bounds_high]
 
@@ -100,13 +104,6 @@ class CMAESTrainer:
             self.hist_train_best_scores = list(st.get("hist_train_best_scores", []))
             self.hist_val = list(st.get("hist_val", []))
             self.hist_sigma = list(st.get("hist_sigma", []))
-            # RNG
-            if st.get("np_rng_state", None) is not None:
-                np.random.set_state(st["np_rng_state"])
-            if st.get("torch_rng_state", None) is not None:
-                torch.set_rng_state(st["torch_rng_state"])
-            if torch.cuda.is_available() and st.get("torch_cuda_rng_state_all", None) is not None:
-                torch.cuda.set_rng_state_all(st["torch_cuda_rng_state_all"])
         else:
             self.best_solution = x0.copy()
             self.best_train = -np.inf
@@ -165,7 +162,6 @@ class CMAESTrainer:
         return int(t.item())
 
     def _allreduce_score_sum(self, d_local: dict) -> dict:
-        # Стабильный порядок ключей
         keys = sorted(d_local.keys())
         vals = torch.tensor([float(d_local[k]) for k in keys], device=self.device)
         if self._is_dist():
@@ -181,13 +177,10 @@ class CMAESTrainer:
                 self._train_iter = iter(self.train_loader)
                 batch = next(self._train_iter)
             batch = list(batch)
-        # один и тот же batch на всех рангах
         batch = self._broadcast_object(batch, src=0)
         return list(batch)
 
     def _gen_images_batch(self, prompts: List[str], generator):
-        # For fair comparison within a generation, fix generator
-        
         out = self.pipeline(
             prompts,
             num_inference_steps=self.gen_params["num_inference_steps"],
@@ -206,6 +199,7 @@ class CMAESTrainer:
 
         total_scores = None
         total_count = 0
+
         micro_bs = int(self.cfg.data.batch_size_train)
 
         gen_device = "cpu"  # reproducibility: CPU generator recommended by diffusers
@@ -233,39 +227,70 @@ class CMAESTrainer:
 
         total_scores = None
         total_count = 0
-        global_idx = 0
         gen_device = "cpu"
+        generator = torch.Generator(device=gen_device).manual_seed(int(seed))
 
-        for prompts in tqdm(self.val_loader, desc="Validating", total=len(self.val_loader)):
+        r = self._rank()
+        w = self._world()
+
+        for batch_idx, prompts in enumerate(
+            tqdm(self.val_loader, desc="Validating", total=len(self.val_loader))
+        ):
             prompts = list(prompts)
             shard_prompts = self._shard_list(prompts)
 
-            # skip empty shards to avoid tokenizer errors on some ranks when
-            # batch_size is not divisible by world size
+            # skip empty shards
             if len(shard_prompts) == 0:
                 continue
 
-            generator = torch.Generator(device=gen_device).manual_seed(int(seed))
-            with torch.inference_mode():
-                out = self.pipeline(
-                    list(shard_prompts),
-                    num_inference_steps=self.gen_params["num_inference_steps"],
-                    guidance_scale=self.gen_params["guidance_scale"],
-                    height=self.gen_params["height"],
-                    width=self.gen_params["width"],
-                    generator=generator,
-                )
-            images = out.images
+            # try to load cached images if all expected files exist
+            use_cached = False
+            cached_images = None
+            if save_dir is not None:
+                os.makedirs(save_dir, exist_ok=True)
+                B = len(prompts)  # full batch size from loader (not sharded)
+                expected_paths = []
+                for j, _ in enumerate(shard_prompts):
+                    p_idx = r + j * w
+                    if p_idx >= B:
+                        continue
+                    global_idx = batch_idx * B + p_idx
+                    fname = f"{global_idx:06d}.{save_format}"
+                    expected_paths.append(os.path.join(save_dir, fname))
 
-            if save_images and save_dir is not None and self._rank() == 0:
+                # load only if we have a file for every item in shard_prompts
+                if len(expected_paths) == len(shard_prompts) and all(os.path.isfile(p) for p in expected_paths):
+                    cached_images = [Image.open(p).convert("RGB") for p in expected_paths]
+                    use_cached = True
+
+            if use_cached:
+                images = cached_images
+            else:
+                with torch.inference_mode():
+                    out = self.pipeline(
+                        list(shard_prompts),
+                        num_inference_steps=self.gen_params["num_inference_steps_val"],
+                        guidance_scale=self.gen_params["guidance_scale"],
+                        height=self.gen_params["height"],
+                        width=self.gen_params["width"],
+                        generator=generator,
+                    )
+                images = out.images
+
+            # save only freshly generated images (do not re-save cached)
+            if (not use_cached) and save_images and save_dir is not None:
                 os.makedirs(save_dir, exist_ok=True)
                 pil_images = to_pil_list(images)
-                for im in pil_images:
+                B = len(prompts)  # full batch size from loader (not sharded)
+                for j, im in enumerate(pil_images):
+                    p_idx = r + j * w
+                    if p_idx >= B:
+                        continue
+                    global_idx = batch_idx * B + p_idx
                     if save_limit is not None and global_idx >= save_limit:
-                        break
+                        continue
                     fname = f"{global_idx:06d}.{save_format}"
                     im.save(os.path.join(save_dir, fname), format=save_format.upper())
-                    global_idx += 1
 
             if self.eval_reward_fn:
                 scores = call_reward(self.eval_reward_fn, images, list(shard_prompts))
@@ -286,12 +311,23 @@ class CMAESTrainer:
             return None
 
 
-    def _log_step(self, step: int, best_fit: float, mean_fit: float, sigma: float, best_x: np.ndarray):
+    def _log_step(self, step: int, best_fit: float, mean_fit: float, sigma: float, best_x: np.ndarray,
+        best_scores: Optional[Dict[str, float]] = None, 
+        mean_scores: Optional[Dict[str, float]] = None):
         scalars = {
-            "train/best": float(best_fit),
-            "train/mean": float(mean_fit),
+            "train/best_fitness": float(best_fit),
+            "train/mean_fitness": float(mean_fit),
             "cmaes/sigma": float(sigma),
         }
+
+        if best_scores is not None:
+            for key, val in best_scores.items():
+                scalars[f"train/best_{key}"] = float(val)
+
+        if mean_scores is not None:
+            for key, val in mean_scores.items():
+                scalars[f"train/mean_{key}"] = float(val)
+
         log_scalars(self.writer, scalars, step)
 
         x = self.pipeline.flatten_coefficients()
@@ -439,6 +475,13 @@ class CMAESTrainer:
                 best_scores = scores[best_idx]
                 mean_fit = -float(np.mean(fitnesses))
 
+                mean_scores = {}
+                if len(scores) > 0:
+                    all_keys = scores[0].keys()
+                    for key in all_keys:
+                        values = [s[key] for s in scores]
+                        mean_scores[key] = float(np.mean(values))
+
                 if best_fit > self.best_train:
                     self.best_train = best_fit
                     self.best_train_scores = best_scores
@@ -448,7 +491,10 @@ class CMAESTrainer:
                 self.hist_train_mean.append(mean_fit)
                 self.hist_train_best_scores.append(best_scores)
 
-                self._log_step(step, best_fit, mean_fit, float(self.es.sigma), best_x)
+                # self._log_step(step, best_fit, mean_fit, float(self.es.sigma), best_x)
+                self._log_step(step, best_fit, mean_fit, float(self.es.sigma), best_x, 
+                               best_scores=best_scores, 
+                               mean_scores=mean_scores)
 
             self._barrier()
 
@@ -498,5 +544,3 @@ class CMAESTrainer:
         )
         best_solution = np.asarray(result["x"], dtype=np.float64)
         return best_solution, result["best_train"], result["best_val"]
-
-# noop: re-commit

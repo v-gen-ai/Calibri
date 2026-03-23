@@ -5,6 +5,7 @@ import torch.nn as nn
 import numpy as np
 
 from diffusers import DiffusionPipeline
+from peft import PeftModel
 
 from .base_sg import BaseSGPipeline
 
@@ -161,7 +162,6 @@ def call___calibri(
         [`~pipelines.stable_diffusion_3.StableDiffusion3PipelineOutput`] if `return_dict` is True, otherwise a
         `tuple`. When returning a tuple, the first element is a list with the generated images.
     """
-    
 
     height = height or self.default_sample_size * self.vae_scale_factor
     width = width or self.default_sample_size * self.vae_scale_factor
@@ -609,13 +609,15 @@ def extend_sd3_transformer_with_sg(
     return model_transformer
 
 
-class SGSD3Pipeline(BaseSGPipeline):
-    def __init__(self, device, dtype, model_name="stabilityai/stable-diffusion-3.5-medium", num_models=2, cfg_case=True, cfg_scale=7.0, verbose=False):
+class SGSD3PipelineLORA(BaseSGPipeline):
+    def __init__(self, device, dtype, model_name="jieliu/SD3.5M-FlowGRPO-GenEval", num_models=1, cfg_case=True, cfg_scale=7.0, verbose = False):
+        base_model_name = "stabilityai/stable-diffusion-3.5-medium"
         ### specify cfg_scale with float only if cfg_case is true
         pipeline = DiffusionPipeline.from_pretrained(
-            model_name,
+            base_model_name,
             torch_dtype=dtype,
-        ).to(device)
+        )
+
         pipeline.transformer.cfg_case = cfg_case
         pipeline.transformer.cfg_scale = cfg_scale
         pipeline.transformer = extend_sd3_transformer_with_sg(
@@ -626,6 +628,11 @@ class SGSD3Pipeline(BaseSGPipeline):
             pipeline.set_progress_bar_config(disable=True)
         
         pipeline.__class__.__call__ = call___calibri
+
+        pipeline.transformer = PeftModel.from_pretrained(pipeline.transformer, model_name)
+        pipeline.transformer = pipeline.transformer.merge_and_unload()
+
+        pipeline = pipeline.to(device)
         self.pipeline = pipeline
     
     def get_coefficient_shapes(self) -> Dict[str, int]:
@@ -642,6 +649,7 @@ class SGSD3Pipeline(BaseSGPipeline):
         context = n_models * n_context * 2
         attn2 = n_models * n_attn2
         models = n_models
+        
         return {
             # must have
             "total": main + context + attn2 + models,

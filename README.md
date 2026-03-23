@@ -18,16 +18,13 @@ pip install -r requirements.txt
 
 ### FLUX/SD3
 ```
-accelerate launch --num_processes 2 --config_file configs/2gpu.yaml scripts/train.py --config configs/scaleguidance.py:cmaes_hpsv3_2models
+accelerate launch --num_processes 2 scripts/train.py --config configs/scaleguidance.py:cmaes_hpsv3_2models
 ```
 
 ### Qwen-Image
 ```
-# Test integration
-python scripts/quick_test_qwen.py
-
 # Full training
-accelerate launch --num_processes 2 --config_file configs/2gpu.yaml scripts/train.py --config configs/scaleguidance.py:cmaes_qwen_hpsv3
+accelerate launch --num_processes 2 scripts/train.py --config configs/scaleguidance.py:cmaes_qwen_hpsv3
 ```
 
 ## Configuration

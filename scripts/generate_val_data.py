@@ -21,7 +21,7 @@ from ml_collections import config_flags
 from src.models.flux_sg import SGFluxPipeline
 from src.utils.utils import set_seed
 from src.data.prompts import make_loader
-from src.optim.cmaes import CMAESTrainer  # используем eval_validation и shapes/flatten
+from src.optim.cmaes import CMAESTrainer
 import src.rewards as rewards
 
 CONFIG = config_flags.DEFINE_config_file("config", default="configs/scaleguidance.py:cmaes_image_reward",

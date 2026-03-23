@@ -1,12 +1,12 @@
 <h1 align="center"> Calibri:<br>Enhancing Diffusion Transformers via Parameter-Efficient Calibration </h1>
 
-<div align="center">
-  <a href='https://arxiv.org/abs/2505.05470'><img src='https://img.shields.io/badge/ArXiv-red?logo=arxiv'></a>  &nbsp;
-  <a href='https://gongyeliu.github.io/Flow-GRPO/'><img src='https://img.shields.io/badge/Visualization-green?logo=github'></a> &nbsp;
-  <a href="https://github.com/yifan123/flow_grpo"><img src="https://img.shields.io/badge/Code-9E95B7?logo=github"></a> &nbsp; 
+<!-- <div align="center">
+  <a href='https://arxiv.org/abs/2505.05470'><img src='https://img.shields.io/badge/ArXiv-red?logo=arxiv'></a>  &nbsp; -->
+  <!-- <a href='https://gongyeliu.github.io/Flow-GRPO/'><img src='https://img.shields.io/badge/Visualization-green?logo=github'></a> &nbsp; -->
+  <!-- <a href="https://github.com/yifan123/flow_grpo"><img src="https://img.shields.io/badge/Code-9E95B7?logo=github"></a> &nbsp; 
   <a href='https://huggingface.co/collections/jieliu/sd35m-flowgrpo-68298ec27a27af64b0654120'><img src='https://img.shields.io/badge/Model-blue?logo=huggingface'></a> &nbsp; 
   <a href='https://huggingface.co/spaces/jieliu/SD3.5-M-Flow-GRPO'><img src='https://img.shields.io/badge/Demo-blue?logo=huggingface'></a> &nbsp;
-</div>
+</div> -->
 
 <br>
 
@@ -79,7 +79,7 @@ You can easily start the calibration process using Accelerate. The algorithm uti
 accelerate launch --num_processes 2 scripts/train.py --config configs/calibri.py:cmaes_hpsv3_flux_layer
 ```
 
-### ⚙️ Scaling Granularity
+### ⚙️ Hyperparameters & Granularity
 
 Calibri is designed to be highly flexible. You can easily customize the target DiT backbone, reward models, and optimization hyperparameters directly via `configs/calibri.py`.
 

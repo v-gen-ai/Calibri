@@ -22,7 +22,7 @@ from src.models.flux_sg import SGFluxPipeline
 from src.utils.utils import set_seed
 from src.data.prompts import make_loader
 from src.optim.cmaes import CMAESTrainer
-import src.rewards as rewards
+import src.metrics.rewards as rewards
 
 CONFIG = config_flags.DEFINE_config_file("config", default="configs/scaleguidance.py:cmaes_image_reward",
                                          help_string="Training configuration to reuse for eval")

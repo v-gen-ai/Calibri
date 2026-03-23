@@ -14,7 +14,7 @@ import torch
 from accelerate import Accelerator
 import torch.distributed as dist
 
-import src.rewards
+import src.metrics.rewards
 from src.utils.utils import set_seed, save_config
 from src.utils.logging_tb import create_writer, NullWriter
 from src.data.prompts import make_loader
@@ -47,8 +47,8 @@ def main(_):
         verbose=False
     )
 
-    reward_fn = getattr(src.rewards, 'multi_score')(cfg.device, cfg.reward_fn)
-    eval_reward_fn = getattr(src.rewards, 'multi_score')(cfg.device, cfg.reward_fn_eval)
+    reward_fn = getattr(src.metrics.rewards, 'multi_score')(cfg.device, cfg.reward_fn)
+    eval_reward_fn = getattr(src.metrics.rewards, 'multi_score')(cfg.device, cfg.reward_fn_eval)
 
     if accelerator.is_main_process:
         os.makedirs(cfg.experiment.log_dir, exist_ok=True)

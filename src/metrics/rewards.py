@@ -695,27 +695,28 @@ def main():
     import torchvision.transforms as transforms
 
     image_paths = [
-        "nasa.jpg",
+        "./data/images/000000.png",
+        "./data/images/000001.png",
     ]
 
     transform = transforms.Compose([
-        transforms.ToTensor(),  # Convert to tensor
+        transforms.ToTensor(),
     ])
 
     images = torch.stack([transform(Image.open(image_path).convert('RGB')) for image_path in image_paths])
     prompts=[
-        'A astronaut’s glove floating in zero-g with "NASA 2049" on the wrist',
+        "a red boat and a blue book",
+        "A dog is playing tug-of-war with its owner and wagging its tail."
     ]
-    metadata = {}  # Example metadata
+    metadata = {}
     score_dict = {
-        "unifiedreward": 1.0
+        # "hpsv3_remote": 1.0,
+        "clipscore": 1.0,
+        "pickscore": 1.0
     }
-    # Initialize the multi_score function with a device and score_dict
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     scoring_fn = multi_score(device, score_dict)
-    # Get the scores
     scores, _ = scoring_fn(images, prompts, metadata)
-    # Print the scores
     print("Scores:", scores)
 
 

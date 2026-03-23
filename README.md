@@ -1,4 +1,4 @@
-# ScaleGuidance
+# Calibri: Enhancing Diffusion Transformers via Parameter-Efficient Calibration
 
 ## Installation
 
@@ -29,11 +29,10 @@ accelerate launch --num_processes 2 scripts/train.py --config configs/scaleguida
 
 ## Configuration
 
-You can find different configs at `configs/scaleguidance.py`:
+You can find different configs at `configs/calibri.py`:
 
 - `cmaes_hpsv3_2models`: FLUX with HPSv3 scoring
 - `cmaes_qwen_hpsv3`: Qwen-Image with HPSv3 scoring
-- `cmaes_qwen_hpsv3_2models`: Two Qwen-Image models
 
 ## Monitoring
 
@@ -41,8 +40,3 @@ You can find different configs at `configs/scaleguidance.py`:
 ```
 tensorboard --logdir=<exp_logdir>
 ```
-
-
-## Documentation
-
-- **Qwen-Image Integration**: [QWEN_INTEGRATION.md](QWEN_INTEGRATION.md)

@@ -1,3 +1,28 @@
+# /// script
+# requires-python = ">=3.12"
+# dependencies = [
+#     "torch==2.5.1+cu118",
+#     "torchvision==0.20.1+cu118",
+#     "pillow",
+#     "transformers==4.36.1",
+#     "accelerate",
+#     "sentencepiece",
+#     "requests",
+#     "icecream",
+#     "protobuf",
+# ]
+#
+# [tool.uv.sources]
+# torch = { index = "pytorch-cu118" }
+# torchvision = { index = "pytorch-cu118" }
+# torchaudio = { index = "pytorch-cu118" }
+#
+# [[tool.uv.index]]
+# name = "pytorch-cu118"
+# url = "https://download.pytorch.org/whl/cu118"
+# explicit = true
+# ///
+
 # scripts/qalign_server.py
 import argparse
 import io

@@ -1,3 +1,29 @@
+# /// script
+# requires-python = ">=3.12"
+# dependencies = [
+#     "torch==2.5.1+cu118",
+#     "torchvision==0.20.1+cu118",
+#     "pillow",
+#     "hpsv3",
+#     "transformers==4.45.2",
+#     "accelerate",
+#     "absl-py",
+#     "requests",
+#     "matplotlib",
+#     "tensorboard"
+# ]
+#
+# [tool.uv.sources]
+# torch = { index = "pytorch-cu118" }
+# torchvision = { index = "pytorch-cu118" }
+# torchaudio = { index = "pytorch-cu118" }
+#
+# [[tool.uv.index]]
+# name = "pytorch-cu118"
+# url = "https://download.pytorch.org/whl/cu118"
+# explicit = true
+# ///
+
 # scripts/hpsv3_server.py
 import argparse
 import io

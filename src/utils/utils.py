@@ -20,18 +20,15 @@ def save_config(cfg, logdir):
     try:
         resolved_json = cfg.to_json_best_effort(indent=2)
     except Exception:
-        # fallback, если вдруг встретились нестандартные типы
         resolved_json = json.dumps(cfg.to_dict(), ensure_ascii=False, indent=2)
     with open(os.path.join(logdir, "config.json"), "w", encoding="utf-8") as f:
         f.write(resolved_json)
 
 def to_pil_list(images):
-    # вход: либо torch.Tensor [N,C,H,W] 0..1 или 0..255, либо список PIL/np
 
     pil_images = []
     if isinstance(images, torch.Tensor):
         arr = images
-        # приведение к uint8
         if arr.dtype.is_floating_point:
             arr = (arr * 255.0).round().clamp(0, 255)
         arr = arr.to(torch.uint8).cpu().numpy()  # NCHW
@@ -40,12 +37,10 @@ def to_pil_list(images):
             pil_images.append(Image.fromarray(im))
         return pil_images
 
-    # список PIL или np.ndarray
     for im in images:
         if isinstance(im, Image.Image):
             pil_images.append(im)
         else:
-            # предполагаем np.ndarray NHWC uint8
             pil_images.append(Image.fromarray(im))
     return pil_images
 

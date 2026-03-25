@@ -433,7 +433,7 @@ def qalign_score(device):
     import os
     import torch
     from transformers import AutoModelForCausalLM
-    from src.utils.utils import to_pil_list  # уже есть в окружении
+    from src.utils.utils import to_pil_list
 
     dtype = torch.float16
 
@@ -451,7 +451,6 @@ def qalign_score(device):
         ) from e
 
     def fn(images, prompts, metadata=None):
-        # prompts не требуются, но сохраняем сигнатуру совместимой
         pil_images = to_pil_list(images)
         if len(pil_images) == 0:
             return [], {}
@@ -462,7 +461,6 @@ def qalign_score(device):
         import torch
         with torch.inference_mode():
             out = model.score(pil_images, task_=task, input_=input_type)
-        # Приводим к списку чисел
         try:
             if isinstance(out, torch.Tensor):
                 scores = out.detach().cpu().tolist()
@@ -527,7 +525,7 @@ def qalign_score_remote(device, url=None):
                 "images": jpeg_images,
                 "task": task,
                 "input": input_type,
-                # "prompts": prompts[i:i+batch_size],  # опционально, не используется моделью
+                # "prompts": prompts[i:i+batch_size],
             }
             data = pickle.dumps(payload)
 
@@ -604,12 +602,10 @@ def hpsv3score_remote(device, url=None):
         pil_images = to_pil_list(images)
         all_scores = []
 
-        # батчевка для экономии памяти и стабильности
         for i in range(0, len(pil_images), batch_size):
             imgs = pil_images[i:i+batch_size]
             prms = prompts[i:i+batch_size]
 
-            # JPEG-компрессия
             jpeg_images = []
             for img in imgs:
                 buf = io.BytesIO()
@@ -622,7 +618,6 @@ def hpsv3score_remote(device, url=None):
             resp = sess.post(url, data=data_bytes, timeout=600)
             # resp.raise_for_status()
             if resp.status_code != 200:
-                # вытащим текст ошибки, который сервер упаковал pickle'ом
                 err = None
                 try:
                     err = pickle.loads(resp.content).get("error")

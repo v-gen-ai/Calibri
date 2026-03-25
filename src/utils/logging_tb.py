@@ -59,13 +59,11 @@ def log_model_scales(writer, alpha_dict: dict, step: int, prefix: str):
         _save_fig_to_tb(fig_ms, f"{prefix}models_scales")
 
 def log_images(writer, tag: str, pil_images, step: int, max_images=8):
-    # склеивание не делаем, логируем первые N изображений поштучно
     for i, im in enumerate(pil_images[:max_images]):
         writer.add_image(f"{tag}/{i}", torch.from_numpy(np.array(im)).permute(2,0,1), step)
 
 def log_scatter(writer, alpha_dict: dict, step: int, prefix: str):
 
-    # Ветвь для по-модельных массивов (список массивов для attn/mlp/single)
     is_multi = isinstance(alpha_dict.get("double_attn"), (list, tuple)) \
                and isinstance(alpha_dict.get("double_mlp"), (list, tuple)) \
                and isinstance(alpha_dict.get("single"), (list, tuple))
@@ -89,7 +87,6 @@ def log_scatter(writer, alpha_dict: dict, step: int, prefix: str):
         num_transformer_blocks = max((len(x) for x in attn_by_model), default=0)
         num_single_blocks = max((len(x) for x in single_by_model), default=0)
 
-        # Отдельный график: Attention
         fig_attn, ax1 = plt.subplots(figsize=(8, 5))
         for m_idx in range(n_models):
             if m_idx < len(attn_by_model):
@@ -117,7 +114,6 @@ def log_scatter(writer, alpha_dict: dict, step: int, prefix: str):
         ax2.grid(True); ax2.legend()
         _save_fig_to_tb(fig_mlp, f"{prefix}double_mlp")
 
-        # Отдельный график: Single
         fig_single, ax3 = plt.subplots(figsize=(12, 5))
         for m_idx in range(n_models):
             if m_idx < len(single_by_model):
@@ -131,7 +127,6 @@ def log_scatter(writer, alpha_dict: dict, step: int, prefix: str):
         ax3.grid(True); ax3.legend()
         _save_fig_to_tb(fig_single, f"{prefix}single")
 
-        # Отдельный график: Model scales (bar)
         if "models_scales" in alpha_dict:
             ms = np.asarray(alpha_dict["models_scales"])
             fig_ms, ax = plt.subplots(figsize=(8, 5))
@@ -141,7 +136,6 @@ def log_scatter(writer, alpha_dict: dict, step: int, prefix: str):
             _save_fig_to_tb(fig_ms, f"{prefix}models_scales")
 
     else:
-        # Fallback для 1D массива: каждый ключ — отдельный график
         for name, arr in alpha_dict.items():
             arr = np.asarray(arr)
             fig, ax = plt.subplots(figsize=(8, 5))

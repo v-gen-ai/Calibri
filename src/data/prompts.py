@@ -53,7 +53,6 @@ class PromptDataset(Dataset):
         return self.prompts[idx]
 
 class InfiniteDataLoader:
-    """Простая бесконечная обёртка над любым DataLoader."""
     def __init__(self, base_loader):
         self.base_loader = base_loader
 
@@ -64,7 +63,6 @@ class InfiniteDataLoader:
 
 
 class CutDataLoader:
-    """Простая бесконечная обёртка над любым DataLoader."""
     def __init__(self, base_loader, max_cnt = 10):
         self.base_loader = base_loader
         self.max_cnt = max_cnt

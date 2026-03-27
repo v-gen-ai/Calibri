@@ -3,7 +3,7 @@
 <div align="center">
   <a href='https://arxiv.org/'><img src='https://img.shields.io/badge/ArXiv-red?logo=arxiv'></a>  &nbsp;
   <a href='https://v-gen-ai.github.io/Calibri-page/'><img src='https://img.shields.io/badge/Visualization-green?logo=github'></a> &nbsp;
-  <a href='https://huggingface.co/v-gen-ai/flux-calibri-gates'><img src='https://img.shields.io/badge/Model-blue?logo=huggingface'></a> &nbsp; 
+  <a href='https://huggingface.co/collections/v-gen-ai/calibri-models'><img src='https://img.shields.io/badge/Model-blue?logo=huggingface'></a> &nbsp; 
   <!-- <a href='https://huggingface.co/spaces/jieliu/SD3.5-M-Flow-GRPO'><img src='https://img.shields.io/badge/Demo-blue?logo=huggingface'></a> &nbsp; -->
 </div>
 

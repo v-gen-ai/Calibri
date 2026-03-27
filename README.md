@@ -107,7 +107,7 @@ If you find Calibri useful for your research or projects, we would greatly appre
 @article{tokhchukov2026calibri,
   title={Calibri: Enhancing Diffusion Transformers via Parameter-Efficient Calibration}, 
   author={Tokhchukov, Danil and Mirzoeva, Aysel and Kuznetsov, Andrey and Sobolev, Konstantin},
-  journal={arXiv preprint arXiv:2600.00000},
+  journal={arXiv preprint arXiv:2603.24800},
   year={2026},
 }
 ```
